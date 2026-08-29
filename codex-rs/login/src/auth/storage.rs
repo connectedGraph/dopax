@@ -18,16 +18,17 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
 
+use super::BedrockAccessKeysAuth;
 use super::BedrockApiKeyAuth;
 use crate::token_data::TokenData;
 use codex_agent_identity::AgentIdentityJwtClaims;
 use codex_agent_identity::decode_agent_identity_jwt;
-use codex_app_server_protocol::AuthMode;
 use codex_config::types::AuthCredentialsStoreMode;
 pub use codex_config::types::AuthKeyringBackendKind;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
+use codex_protocol::auth::AuthMode;
 use codex_secrets::LocalSecretsNamespace;
 use codex_secrets::SecretName;
 use codex_secrets::SecretScope;
@@ -58,6 +59,9 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_api_key: Option<BedrockApiKeyAuth>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_access_keys: Option<BedrockAccessKeysAuth>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -92,11 +96,35 @@ pub struct AgentIdentityAuthRecord {
     pub agent_private_key: String,
     pub account_id: String,
     pub chatgpt_user_id: String,
-    pub email: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string",
+        serialize_with = "serialize_optional_string_as_empty"
+    )]
+    pub email: Option<String>,
     pub plan_type: AccountPlanType,
     pub chatgpt_account_is_fedramp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+}
+
+fn deserialize_optional_non_empty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| value.filter(|value| !value.is_empty()))
+}
+
+fn serialize_optional_string_as_empty<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    value.as_deref().unwrap_or_default().serialize(serializer)
 }
 
 impl AgentIdentityAuthRecord {

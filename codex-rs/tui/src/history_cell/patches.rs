@@ -1,6 +1,8 @@
 //! Patch summaries and image-tool transcript helpers.
 
 use super::*;
+use crate::diff_render::create_diff_preview;
+use codex_utils_path_uri::LegacyAppPathString;
 
 #[derive(Debug)]
 pub(crate) struct PatchHistoryCell {
@@ -10,6 +12,10 @@ pub(crate) struct PatchHistoryCell {
 
 impl HistoryCell for PatchHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        create_diff_preview(&self.changes, &self.cwd, width as usize)
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         create_diff_summary(&self.changes, &self.cwd, width as usize)
     }
 
@@ -42,11 +48,7 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
 
     if !stderr.trim().is_empty() {
         let output = output_lines(
-            Some(&CommandOutput {
-                exit_code: 1,
-                formatted_output: String::new(),
-                aggregated_output: stderr,
-            }),
+            Some(&CommandOutput::new(/*exit_code*/ 1, stderr)),
             OutputLinesParams {
                 line_limit: TOOL_CALL_MAX_LINES,
                 only_err: true,
@@ -60,8 +62,12 @@ pub(crate) fn new_patch_apply_failure(stderr: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_view_image_tool_call(path: AbsolutePathBuf, cwd: &Path) -> PlainHistoryCell {
-    let display_path = display_path_for(path.as_path(), cwd);
+pub(crate) fn new_view_image_tool_call(path: LegacyAppPathString, cwd: &Path) -> PlainHistoryCell {
+    let display_path = path
+        .to_inferred_path_uri()
+        .and_then(|path| path.to_abs_path().ok())
+        .map(|path| display_path_for(path.as_path(), cwd))
+        .unwrap_or_else(|| path.into_string());
 
     let lines: Vec<Line<'static>> = vec![
         vec!["• ".dim(), "Viewed Image".bold()].into(),

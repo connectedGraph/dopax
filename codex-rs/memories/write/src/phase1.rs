@@ -13,9 +13,9 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout::INTERACTIVE_SESSION_SOURCES;
+use codex_rollout::RolloutItem;
 use codex_rollout::should_persist_response_item_for_memories;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
@@ -303,10 +303,11 @@ mod job {
                 )?,
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         }];
         prompt.base_instructions = BaseInstructions {
             text: crate::stage_one::PROMPT.to_string(),
+            provenance: None,
         };
         prompt.output_schema = Some(output_schema());
         prompt.output_schema_strict = true;
@@ -407,13 +408,17 @@ mod job {
         let filtered = items
             .iter()
             .filter_map(|item| match item {
-                RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(item),
+                RolloutItem::ResponseItem(item) => sanitize_response_item_for_memories(&item.item),
                 RolloutItem::InterAgentCommunication(communication) => {
                     Some(communication.to_model_input_item())
                 }
                 RolloutItem::SessionMeta(_)
+                | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::RealtimeItem(_)
+                | RolloutItem::WorldState(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
@@ -429,7 +434,7 @@ mod job {
             role,
             content,
             phase,
-            metadata,
+            internal_chat_message_metadata_passthrough: metadata,
         } = item
         else {
             return should_persist_response_item_for_memories(item).then(|| item.clone());
@@ -457,7 +462,7 @@ mod job {
             role: role.clone(),
             content,
             phase: phase.clone(),
-            metadata: metadata.clone(),
+            internal_chat_message_metadata_passthrough: metadata.clone(),
         })
     }
 
@@ -648,6 +653,11 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats) {
         );
         context.histogram(
             MEMORY_PHASE_ONE_TOKEN_USAGE,
+            token_usage.cache_write_input_tokens.max(0),
+            &[("token_type", "cache_write_input")],
+        );
+        context.histogram(
+            MEMORY_PHASE_ONE_TOKEN_USAGE,
             token_usage.output_tokens.max(0),
             &[("token_type", "output")],
         );
@@ -664,7 +674,9 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::security_risk::SecurityRiskScore;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
 
     #[test]
     fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
@@ -687,7 +699,7 @@ mod tests {
                 },
             ],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let skill_message = ResponseItem::Message {
             id: None,
@@ -698,7 +710,7 @@ mod tests {
                         .to_string(),
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let subagent_message = ResponseItem::Message {
             id: None,
@@ -708,13 +720,19 @@ mod tests {
                     .to_string(),
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         };
 
         let serialized = job::serialize_filtered_rollout_response_items(&[
-            RolloutItem::ResponseItem(mixed_contextual_message),
-            RolloutItem::ResponseItem(skill_message),
-            RolloutItem::ResponseItem(subagent_message.clone()),
+            RolloutItem::ResponseItem(mixed_contextual_message.into()),
+            RolloutItem::ResponseItem(skill_message.into()),
+            RolloutItem::SecurityRiskScore(SecurityRiskScore {
+                scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+                call_id: None,
+                action: None,
+                sampled_at: None,
+            }),
+            RolloutItem::ResponseItem(subagent_message.clone().into()),
         ])
         .expect("serialize");
         let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
@@ -730,7 +748,7 @@ mod tests {
                             .to_string(),
                     }],
                     phase: None,
-                    metadata: None,
+                    internal_chat_message_metadata_passthrough: None,
                 },
                 subagent_message,
             ]
@@ -743,15 +761,18 @@ mod tests {
             job::serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "call_123".to_string(),
+                    call_id: Some("call_123".to_string()),
+                    name: None,
+                    namespace: None,
                     output: codex_protocol::models::FunctionCallOutputPayload {
                         body: codex_protocol::models::FunctionCallOutputBody::Text(
                             r#"{"token":"sk-abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),
                         ),
                         success: Some(true),
                     },
-                    metadata: None,
-                },
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
             )])
             .expect("serialize");
 
@@ -791,6 +812,27 @@ mod tests {
     }
 
     #[test]
+    fn serializes_agent_message_response_items_for_memory() {
+        let communication = InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::root().join("worker").expect("agent path"),
+            Vec::new(),
+            "delegated task".to_string(),
+            /*trigger_turn*/ true,
+        );
+        let response_item = communication.to_model_input_item();
+
+        let serialized = job::serialize_filtered_rollout_response_items(&[
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+            RolloutItem::ResponseItem(response_item.clone().into()),
+        ])
+        .expect("serialize");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert_eq!(parsed, vec![response_item]);
+    }
+
+    #[test]
     fn count_outcomes_sums_token_usage_across_all_jobs() {
         let counts = aggregate_stats(vec![
             JobResult {
@@ -798,9 +840,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 10,
                     cached_input_tokens: 2,
+                    cache_write_input_tokens: 0,
                     output_tokens: 3,
                     reasoning_output_tokens: 1,
                     total_tokens: 13,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -808,9 +852,11 @@ mod tests {
                 token_usage: Some(TokenUsage {
                     input_tokens: 7,
                     cached_input_tokens: 1,
+                    cache_write_input_tokens: 0,
                     output_tokens: 2,
                     reasoning_output_tokens: 0,
                     total_tokens: 9,
+                    codex_rollout_budget_units: None,
                 }),
             },
             JobResult {
@@ -828,9 +874,11 @@ mod tests {
             Some(TokenUsage {
                 input_tokens: 17,
                 cached_input_tokens: 3,
+                cache_write_input_tokens: 0,
                 output_tokens: 5,
                 reasoning_output_tokens: 1,
                 total_tokens: 22,
+                codex_rollout_budget_units: None,
             })
         );
     }

@@ -3,19 +3,16 @@ use std::path::Path;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
-use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditOutcome;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditParams;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::JSONRPCError;
-use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
 use pretty_assertions::assert_eq;
-use serde::de::DeserializeOwned;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -44,6 +41,7 @@ async fn consume_rate_limit_reset_credit_requires_chatgpt_auth() -> Result<()> {
         .send_consume_account_rate_limit_reset_credit_request(
             ConsumeAccountRateLimitResetCreditParams {
                 idempotency_key: "request-1".to_string(),
+                credit_id: None,
             },
         )
         .await?;
@@ -121,6 +119,48 @@ async fn consume_account_rate_limit_reset_credit_maps_backend_outcomes() -> Resu
 }
 
 #[tokio::test]
+async fn consume_account_rate_limit_reset_credit_forwards_selected_credit_id() -> Result<()> {
+    let (codex_home, server) = chatgpt_test_context().await?;
+    Mock::given(method("POST"))
+        .and(path("/api/codex/rate-limit-reset-credits/consume"))
+        .and(header("authorization", "Bearer chatgpt-token"))
+        .and(header("chatgpt-account-id", "account-123"))
+        .and(body_json(json!({
+            "redeem_request_id": "request-selected",
+            "credit_id": "credit-123",
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "code": "reset", "windows_reset": 2 })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut mcp = initialized_app_server(codex_home.path()).await?;
+    let request_id = mcp
+        .send_consume_account_rate_limit_reset_credit_request(
+            ConsumeAccountRateLimitResetCreditParams {
+                idempotency_key: "request-selected".to_string(),
+                credit_id: Some("credit-123".to_string()),
+            },
+        )
+        .await?;
+
+    assert_eq!(
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_response::<ConsumeAccountRateLimitResetCreditResponse>(request_id),
+        )
+        .await??,
+        ConsumeAccountRateLimitResetCreditResponse {
+            outcome: ConsumeAccountRateLimitResetCreditOutcome::Reset,
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn consume_account_rate_limit_reset_credit_rejects_empty_idempotency_key() -> Result<()> {
     let (codex_home, _server) = chatgpt_test_context().await?;
     let mut mcp = initialized_app_server(codex_home.path()).await?;
@@ -129,6 +169,7 @@ async fn consume_account_rate_limit_reset_credit_rejects_empty_idempotency_key()
         .send_consume_account_rate_limit_reset_credit_request(
             ConsumeAccountRateLimitResetCreditParams {
                 idempotency_key: String::new(),
+                credit_id: None,
             },
         )
         .await?;
@@ -136,6 +177,26 @@ async fn consume_account_rate_limit_reset_credit_rejects_empty_idempotency_key()
 
     assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(error.error.message, "idempotencyKey must not be empty");
+    Ok(())
+}
+
+#[tokio::test]
+async fn consume_account_rate_limit_reset_credit_rejects_empty_credit_id() -> Result<()> {
+    let (codex_home, _server) = chatgpt_test_context().await?;
+    let mut mcp = initialized_app_server(codex_home.path()).await?;
+
+    let request_id = mcp
+        .send_consume_account_rate_limit_reset_credit_request(
+            ConsumeAccountRateLimitResetCreditParams {
+                idempotency_key: "request-1".to_string(),
+                credit_id: Some(String::new()),
+            },
+        )
+        .await?;
+    let error = read_error_response(&mut mcp, request_id).await?;
+
+    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert_eq!(error.error.message, "creditId must not be empty");
     Ok(())
 }
 
@@ -177,15 +238,15 @@ async fn consume_timeout_releases_account_auth_queue() -> Result<()> {
         .mount(&server)
         .await;
 
-    let mut mcp = TestAppServer::new_with_env(
-        codex_home.path(),
-        &[
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[
             ("OPENAI_API_KEY", None),
             (RATE_LIMIT_RESET_REQUEST_TIMEOUT_ENV_VAR, Some("100")),
-        ],
-    )
-    .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+        ])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
     let consume_id = send_consume_reset_credit(&mut mcp, "request-timeout").await?;
     let account_id = mcp
         .send_get_account_request(GetAccountParams {
@@ -204,12 +265,11 @@ async fn consume_timeout_releases_account_auth_queue() -> Result<()> {
         "rate limit reset consume timed out"
     );
 
-    let account_error = read_error_response(&mut mcp, account_id).await?;
-    assert_eq!(account_error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        account_error.error.message,
-        "email and plan type are required for chatgpt authentication"
-    );
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(account_id)),
+    )
+    .await??;
     Ok(())
 }
 
@@ -228,9 +288,12 @@ async fn chatgpt_test_context() -> Result<(TempDir, MockServer)> {
 }
 
 async fn initialized_app_server(codex_home: &Path) -> Result<TestAppServer> {
-    let mut mcp = TestAppServer::new_with_env(codex_home, &[("OPENAI_API_KEY", None)]).await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    Ok(mcp)
+    TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await
 }
 
 async fn consume_reset_credit(
@@ -238,28 +301,17 @@ async fn consume_reset_credit(
     idempotency_key: &str,
 ) -> Result<ConsumeAccountRateLimitResetCreditResponse> {
     let request_id = send_consume_reset_credit(mcp, idempotency_key).await?;
-    read_response(mcp, request_id).await
+    timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await?
 }
 
 async fn send_consume_reset_credit(mcp: &mut TestAppServer, idempotency_key: &str) -> Result<i64> {
     mcp.send_consume_account_rate_limit_reset_credit_request(
         ConsumeAccountRateLimitResetCreditParams {
             idempotency_key: idempotency_key.to_string(),
+            credit_id: None,
         },
     )
     .await
-}
-
-async fn read_response<T>(mcp: &mut TestAppServer, request_id: i64) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    to_response(response)
 }
 
 async fn read_error_response(mcp: &mut TestAppServer, request_id: i64) -> Result<JSONRPCError> {
@@ -274,7 +326,11 @@ async fn read_error_response(mcp: &mut TestAppServer, request_id: i64) -> Result
 async fn login_with_api_key(mcp: &mut TestAppServer, api_key: &str) -> Result<()> {
     let request_id = mcp.send_login_account_api_key_request(api_key).await?;
     assert_eq!(
-        read_response::<LoginAccountResponse>(mcp, request_id).await?,
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_response::<LoginAccountResponse>(request_id),
+        )
+        .await??,
         LoginAccountResponse::ApiKey {}
     );
     Ok(())

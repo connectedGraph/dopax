@@ -39,7 +39,7 @@ mod thread_list_cwd_filter_tests {
 mod background_terminal_pagination_tests {
     use super::super::paginate_background_terminals;
     use codex_app_server_protocol::ThreadBackgroundTerminal;
-    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::LegacyAppPathString;
     use pretty_assertions::assert_eq;
 
     fn terminal(process_id: &str) -> ThreadBackgroundTerminal {
@@ -49,7 +49,7 @@ mod background_terminal_pagination_tests {
             item_id: format!("item-{process_id}"),
             process_id: process_id.to_string(),
             command: format!("command-{process_id}"),
-            cwd: AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd"),
+            cwd: LegacyAppPathString::from_string(cwd),
             os_pid: None,
             cpu_percent: None,
             rss_kb: None,
@@ -124,15 +124,8 @@ mod thread_processor_behavior_tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
-    use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
     use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ReasoningEffort;
-    use codex_protocol::permissions::FileSystemAccessMode;
-    use codex_protocol::permissions::FileSystemPath;
-    use codex_protocol::permissions::FileSystemSandboxEntry;
-    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::SubAgentSource;
@@ -480,9 +473,14 @@ mod thread_processor_behavior_tests {
             updated_at: updated_at.with_timezone(&Utc),
             recency_at: updated_at.with_timezone(&Utc),
             archived_at: None,
+            section: None,
+            section_position: None,
+            section_entered_at: None,
+            project_id: None,
             cwd: PathBuf::from("/tmp"),
             cli_version: "0.0.0".to_string(),
             source: SessionSource::Cli,
+            history_mode: Default::default(),
             thread_source: Some(codex_protocol::protocol::ThreadSource::User),
             agent_nickname: None,
             agent_role: None,
@@ -505,82 +503,6 @@ mod thread_processor_behavior_tests {
             summary.updated_at.as_deref(),
             Some("2025-01-02T03:04:06.789Z")
         );
-    }
-
-    #[test]
-    fn requested_permissions_trust_project_uses_permission_profile_intent() {
-        let cwd = test_path_buf("/tmp/project").abs();
-        let full_access_profile = codex_protocol::models::PermissionProfile::Disabled;
-        let workspace_write_profile = codex_protocol::models::PermissionProfile::workspace_write();
-        let read_only_profile = codex_protocol::models::PermissionProfile::read_only();
-        let split_write_profile =
-            codex_protocol::models::PermissionProfile::from_runtime_permissions(
-                &FileSystemSandboxPolicy::restricted(vec![
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::Path { path: cwd.clone() },
-                        access: FileSystemAccessMode::Write,
-                    },
-                    FileSystemSandboxEntry {
-                        path: FileSystemPath::GlobPattern {
-                            pattern: "/tmp/project/**/*.env".to_string(),
-                        },
-                        access: FileSystemAccessMode::Deny,
-                    },
-                ]),
-                NetworkSandboxPolicy::Restricted,
-            );
-
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(full_access_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(workspace_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(split_write_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(
-                    BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string()
-                ),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                permission_profile: Some(read_only_profile),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
-        assert!(!requested_permissions_trust_project(
-            &ConfigOverrides {
-                default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY.to_string()),
-                ..Default::default()
-            },
-            cwd.as_path()
-        ));
     }
 
     #[test]
@@ -685,6 +607,7 @@ mod thread_processor_behavior_tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            supports_standalone_web_search: false,
         };
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),
@@ -776,11 +699,12 @@ mod thread_processor_behavior_tests {
                     developer_instructions: None,
                 },
             },
-            multi_agent_mode: Default::default(),
             session_source: SessionSource::Cli,
+            history_mode: Default::default(),
             forked_from_thread_id: None,
             parent_thread_id: None,
             thread_source: None,
+            originator: "test_originator".to_string(),
         };
 
         assert_eq!(
@@ -991,9 +915,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_returns_empty_preview_when_no_user_message() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
         use std::fs::FileTimes;
 
@@ -1004,6 +928,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: conversation_id.into(),
             id: conversation_id,
             timestamp: timestamp.clone(),
             model_provider: None,
@@ -1012,6 +937,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp: timestamp.clone(),
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta.clone(),
                 git: None,
@@ -1047,9 +973,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_agent_nickname() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;
@@ -1060,6 +986,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: parent_thread_id.into(),
             id: conversation_id,
             timestamp: timestamp.clone(),
             source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
@@ -1078,6 +1005,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp,
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta,
                 git: None,
@@ -1097,9 +1025,9 @@ mod thread_processor_behavior_tests {
 
     #[tokio::test]
     async fn read_summary_from_rollout_preserves_forked_from_id() -> Result<()> {
-        use codex_protocol::protocol::RolloutItem;
-        use codex_protocol::protocol::RolloutLine;
         use codex_protocol::protocol::SessionMetaLine;
+        use codex_rollout::RolloutItem;
+        use codex_rollout::RolloutLine;
         use std::fs;
 
         let temp_dir = TempDir::new()?;
@@ -1110,6 +1038,7 @@ mod thread_processor_behavior_tests {
         let timestamp = "2025-09-05T16:53:11.850Z".to_string();
 
         let session_meta = SessionMeta {
+            session_id: conversation_id.into(),
             id: conversation_id,
             forked_from_id: Some(forked_from_id),
             timestamp: timestamp.clone(),
@@ -1119,6 +1048,7 @@ mod thread_processor_behavior_tests {
 
         let line = RolloutLine {
             timestamp,
+            ordinal: None,
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: session_meta,
                 git: None,
@@ -1156,6 +1086,7 @@ mod thread_processor_behavior_tests {
                     turn_id: "turn-1".to_string(),
                     item_id: "call-1".to_string(),
                     questions: vec![],
+                    is_blocking: true,
                     auto_resolution_ms: None,
                 },
             ))

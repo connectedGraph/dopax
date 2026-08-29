@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
+use crate::protocol::CAPABILITY_ROOTS_DISCOVER_METHOD;
+use crate::protocol::CapabilityRootsDiscoverParams;
+use crate::protocol::ENVIRONMENT_CONFIG_READ_METHOD;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
+use crate::protocol::ENVIRONMENT_STATUS_METHOD;
 use crate::protocol::EXEC_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_SIGNAL_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
 use crate::protocol::EXEC_WRITE_METHOD;
+use crate::protocol::EnvironmentConfigReadParams;
 use crate::protocol::ExecParams;
 use crate::protocol::FS_CANONICALIZE_METHOD;
 use crate::protocol::FS_CLOSE_METHOD;
@@ -17,6 +22,7 @@ use crate::protocol::FS_READ_BLOCK_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
 use crate::protocol::FS_REMOVE_METHOD;
+use crate::protocol::FS_WALK_METHOD;
 use crate::protocol::FS_WRITE_FILE_METHOD;
 use crate::protocol::FsCanonicalizeParams;
 use crate::protocol::FsCloseParams;
@@ -28,6 +34,7 @@ use crate::protocol::FsReadBlockParams;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
+use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::HTTP_REQUEST_METHOD;
 use crate::protocol::HttpRequestParams;
@@ -68,6 +75,22 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
     router.request(
         ENVIRONMENT_INFO_METHOD,
         |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
+    );
+    router.request(
+        ENVIRONMENT_CONFIG_READ_METHOD,
+        |handler: Arc<ExecServerHandler>, params: EnvironmentConfigReadParams| async move {
+            handler.environment_config_read(params).await
+        },
+    );
+    router.request(
+        ENVIRONMENT_STATUS_METHOD,
+        |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_status() },
+    );
+    router.request(
+        CAPABILITY_ROOTS_DISCOVER_METHOD,
+        |handler: Arc<ExecServerHandler>, params: CapabilityRootsDiscoverParams| async move {
+            handler.discover_capability_roots(params).await
+        },
     );
     router.request(
         EXEC_READ_METHOD,
@@ -145,6 +168,12 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         FS_READ_DIRECTORY_METHOD,
         |handler: Arc<ExecServerHandler>, params: FsReadDirectoryParams| async move {
             handler.fs_read_directory(params).await
+        },
+    );
+    router.request(
+        FS_WALK_METHOD,
+        |handler: Arc<ExecServerHandler>, params: FsWalkParams| async move {
+            handler.fs_walk(params).await
         },
     );
     router.request(

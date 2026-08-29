@@ -1,4 +1,5 @@
 use codex_config::types::AppToolApproval;
+use codex_config::types::McpServerAuth;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerEnvVar;
 use codex_config::types::McpServerToolConfig;
@@ -69,7 +70,7 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
                 entry["env_vars"] = array_from_env_vars(env_vars);
             }
             if let Some(cwd) = cwd {
-                entry["cwd"] = value(cwd.to_string_lossy().to_string());
+                entry["cwd"] = value(cwd.as_str());
             }
         }
         McpServerTransportConfig::StreamableHttp {
@@ -77,6 +78,7 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            http_headers_helper,
         } => {
             entry["url"] = value(url.clone());
             if let Some(env_var) = bearer_token_env_var {
@@ -92,9 +94,15 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
             {
                 entry["env_http_headers"] = table_from_pairs(headers.iter());
             }
+            if let Some(command) = http_headers_helper {
+                entry["http_headers_helper"] = value(command.clone());
+            }
         }
     }
 
+    if matches!(&config.auth, McpServerAuth::ChatGpt) {
+        entry["auth"] = value("chatgpt");
+    }
     if !config.enabled {
         entry["enabled"] = value(false);
     }
@@ -107,6 +115,9 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     if config.supports_parallel_tool_calls {
         entry["supports_parallel_tool_calls"] = value(true);
     }
+    if let Some(omit_tools_from) = &config.omit_tools_from {
+        entry["omit_tools_from"] = array_from_iter(omit_tools_from.iter().map(ToString::to_string));
+    }
     if let Some(timeout) = config.startup_timeout_sec {
         entry["startup_timeout_sec"] = value(timeout.as_secs_f64());
     }
@@ -117,6 +128,7 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
         entry["default_tools_approval_mode"] = value(match approval_mode {
             AppToolApproval::Auto => "auto",
             AppToolApproval::Prompt => "prompt",
+            AppToolApproval::Writes => "writes",
             AppToolApproval::Approve => "approve",
         });
     }
@@ -135,14 +147,23 @@ fn serialize_mcp_server_table(config: &McpServerConfig) -> TomlTable {
     {
         entry["scopes"] = array_from_iter(scopes.iter().cloned());
     }
-    if let Some(oauth) = &config.oauth
-        && let Some(client_id) = &oauth.client_id
-        && !client_id.is_empty()
-    {
+    if let Some(oauth) = &config.oauth {
         let mut oauth_table = TomlTable::new();
         oauth_table.set_implicit(false);
-        oauth_table["client_id"] = value(client_id.clone());
-        entry["oauth"] = TomlItem::Table(oauth_table);
+        if let Some(client_id) = &oauth.client_id
+            && !client_id.is_empty()
+        {
+            oauth_table["client_id"] = value(client_id.clone());
+        }
+        if let Some(callback_url) = &oauth.callback_url {
+            oauth_table["callback_url"] = value(callback_url.clone());
+        }
+        if let Some(callback_port) = oauth.callback_port {
+            oauth_table["callback_port"] = value(i64::from(callback_port));
+        }
+        if !oauth_table.is_empty() {
+            entry["oauth"] = TomlItem::Table(oauth_table);
+        }
     }
     if let Some(resource) = &config.oauth_resource
         && !resource.is_empty()
@@ -169,6 +190,7 @@ fn serialize_mcp_server_tool(config: &McpServerToolConfig) -> TomlItem {
         entry["approval_mode"] = value(match approval_mode {
             AppToolApproval::Auto => "auto",
             AppToolApproval::Prompt => "prompt",
+            AppToolApproval::Writes => "writes",
             AppToolApproval::Approve => "approve",
         });
     }

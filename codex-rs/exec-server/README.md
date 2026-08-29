@@ -16,18 +16,28 @@ filesystem operations and `codex-linux-sandbox`.
 
 ## Transport
 
-The server speaks the shared `codex-app-server-protocol` message envelope on
-the wire.
+The server speaks the exec-specific `codex-exec-server-protocol` message
+envelope on the wire.
 
 The CLI entrypoint supports:
 
 - `ws://IP:PORT` (default)
 - `--remote URL --environment-id ID [--name NAME]`
+- `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
 
 Remote mode registers the local exec-server with the environment registry,
 then reconnects to the service-provided rendezvous websocket as the environment.
 Remote communication uses the Noise relay contract; the registry and harness
 must support it.
+Forward mode uses the same registration and Noise relay, but opens an independent
+WebSocket connection to the destination exec-server for each authenticated
+harness stream. Complete message payloads pass unchanged in both directions;
+the forwarder does not parse RPCs, initialize sessions, or execute requests.
+The destination owns session IDs, processes, and session resumption.
+Disconnecting either side closes its peer and resets the remote stream. The
+existing harness reconnect flow can then resume a retained destination session.
+The forwarder does not replay requests or persist execution state, so recovery
+is limited by the destination's session and process-output retention.
 It uses the standard Codex ChatGPT sign-in state; run `codex login` first when
 remote registration needs authentication. Containerized callers that receive an
 Agent Identity JWT in `CODEX_ACCESS_TOKEN` can opt into that auth path with
@@ -46,7 +56,7 @@ codex exec-server \
 
 Wire framing:
 
-- local websocket: one JSON-RPC message per websocket frame
+- local websocket: one JSON-RPC message per websocket message
 - Noise remote websocket: binary protobuf relay frames carrying encrypted payloads
 
 ## Remote Relay Message Format
@@ -59,6 +69,8 @@ identity plus endpoint-owned reliability metadata:
 ```text
 version
 stream_id
+traceparent       // optional W3C parent on the first frame of a traced request
+tracestate        // optional W3C vendor state paired with traceparent
 body              // handshake | data | ack_frame | resume | reset | heartbeat
 ack               // highest contiguous peer segment seq received
 ack_bits          // bitset for peer segment seqs after ack
@@ -115,6 +127,9 @@ Each connection follows this sequence:
 3. Send `initialized`.
 4. Call process or filesystem RPCs.
 
+Requests run sequentially by default. Pass `--concurrent-requests <COUNT>` to
+enable concurrent processing.
+
 If the server receives any notification other than `initialized`, it replies
 with an error using request id `-1`.
 
@@ -138,8 +153,21 @@ Request params:
 Response:
 
 ```json
-{}
+{
+  "sessionId": "00000000-0000-4000-8000-000000000001",
+  "environmentInfo": {
+    "shell": { "name": "bash", "path": "/bin/bash" },
+    "cwd": "file:///workspace"
+  }
+}
 ```
+
+`environmentInfo` contains the same executor metadata returned by
+`environment/info`, so clients can use it without a second request.
+
+Rust clients cache this metadata for the client's lifetime, including session
+resumption. If initialization omits it, the first metadata request fetches and
+caches `environment/info`.
 
 ### `initialized`
 
@@ -321,9 +349,14 @@ Params:
 {
   "processId": "proc-1",
   "seq": 2,
-  "exitCode": 0
+  "exitCode": 0,
+  "sandboxDenied": false
 }
 ```
+
+`sandboxDenied` lets streaming clients preserve executor-side sandbox denial
+detection without issuing a final `process/read` request. Clients recover it
+with `process/read` when an older server omits the field.
 
 ### `process/closed`
 
@@ -334,15 +367,16 @@ Params:
 
 ```json
 {
-  "processId": "proc-1"
+  "processId": "proc-1",
+  "seq": 3
 }
 ```
 
 ## Filesystem RPCs
 
-Filesystem methods use canonical `file:` URIs and return JSON-RPC errors for
-invalid or unavailable paths. For compatibility, requests also accept native
-absolute path strings and normalize them to `file:` URIs:
+Filesystem methods require valid `file:` URI strings and return JSON-RPC errors
+for invalid or unavailable paths. Native absolute path strings are rejected;
+callers must convert them to `file:` URIs before sending requests:
 
 - `fs/readFile`
 - `fs/open`, `fs/readBlock`, and `fs/close` (internal transport for
@@ -394,11 +428,13 @@ The crate exports:
 - `RemoteEnvironmentConfig` and `run_remote_environment()` for embedding remote
   registration mode
 
-Callers must pass `ExecServerRuntimePaths` to `run_main()`. The top-level
-`codex exec-server` command builds these paths from the `codex` arg0 dispatch
-state. `RemoteEnvironmentConfig::new(...)` also takes the auth provider that
-remote registration should use; the CLI builds that provider from Codex auth
-state before starting remote mode.
+Callers must pass `ExecServerRuntimePaths` and an explicitly configured
+`HttpClientFactory` to `run_main()`. The top-level `codex exec-server` command
+builds these paths from the `codex` arg0 dispatch state and resolves its HTTP
+client factory from the effective Codex configuration.
+`RemoteEnvironmentConfig::new(...)` also takes the auth provider and HTTP client
+factory that remote registration mode should use; the CLI builds the auth
+provider from Codex auth state before starting remote mode.
 
 ## Example session
 
@@ -406,7 +442,7 @@ Initialize:
 
 ```json
 {"id":1,"method":"initialize","params":{"clientName":"example-client"}}
-{"id":1,"result":{}}
+{"id":1,"result":{"sessionId":"00000000-0000-4000-8000-000000000001","environmentInfo":{"shell":{"name":"bash","path":"/bin/bash"},"cwd":"file:///tmp"}}}
 {"method":"initialized","params":{}}
 ```
 
@@ -431,6 +467,6 @@ Terminate it:
 ```json
 {"id":4,"method":"process/terminate","params":{"processId":"proc-1"}}
 {"id":4,"result":{"running":true}}
-{"method":"process/exited","params":{"processId":"proc-1","seq":3,"exitCode":0}}
-{"method":"process/closed","params":{"processId":"proc-1"}}
+{"method":"process/exited","params":{"processId":"proc-1","seq":3,"exitCode":0,"sandboxDenied":false}}
+{"method":"process/closed","params":{"processId":"proc-1","seq":4}}
 ```

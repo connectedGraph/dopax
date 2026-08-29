@@ -1,24 +1,35 @@
 use super::*;
+use crate::context::APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX;
+use crate::context::UserInstructions;
+use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSection;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_history::CodexHarnessMetadata;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::AgentPath;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
-use codex_protocol::models::ResponseItemMetadata;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::default_input_modalities;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnContextItem;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -33,6 +44,38 @@ use regex_lite::Regex;
 
 const EXEC_FORMAT_MAX_BYTES: usize = 10_000;
 const EXEC_FORMAT_MAX_TOKENS: usize = 2_500;
+const TEST_WAV_SAMPLE_RATE: u32 = 8_000;
+
+fn unknown_content_metadata() -> InternalChatMessageMetadataPassthrough {
+    InternalChatMessageMetadataPassthrough {
+        content_item_kinds: Some(vec![ContentItemKind("unknown".to_string())]),
+        ..Default::default()
+    }
+}
+
+fn pcm_wav_data_url(sample_count: u32) -> (String, usize) {
+    let padding = sample_count % 2;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + sample_count + padding).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&TEST_WAV_SAMPLE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&TEST_WAV_SAMPLE_RATE.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&sample_count.to_le_bytes());
+    bytes.resize(
+        bytes.len() + sample_count as usize + padding as usize,
+        /*value*/ 0,
+    );
+    let payload = BASE64_STANDARD.encode(bytes);
+    let payload_len = payload.len();
+    (format!("data:audio/wav;base64,{payload}"), payload_len)
+}
 
 fn assistant_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -42,7 +85,7 @@ fn assistant_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     }
 }
 
@@ -61,7 +104,7 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
             text: serde_json::to_string(&communication).unwrap(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     }
 }
 
@@ -73,6 +116,146 @@ fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
     h
 }
 
+fn raw_items(history: &ContextManager) -> Vec<ResponseItem> {
+    history.raw_items().cloned().collect()
+}
+
+#[test]
+fn conversation_history_snapshot_shares_response_items_until_history_changes() {
+    let mut history = create_history_with_items(vec![assistant_msg("original")]);
+    let snapshot = history.conversation_history_snapshot();
+
+    let original = history.raw_items().next().expect("original history item");
+    let shared = snapshot.items().next().expect("shared snapshot item");
+    assert!(std::ptr::eq(original, shared));
+
+    history.record_items(
+        std::iter::once(&assistant_msg("later")),
+        TruncationPolicy::Tokens(10_000),
+    );
+
+    assert_eq!(
+        snapshot.items().cloned().collect::<Vec<_>>(),
+        vec![assistant_msg("original")],
+    );
+    assert_eq!(
+        raw_items(&history),
+        vec![assistant_msg("original"), assistant_msg("later")],
+    );
+
+    history.replace(vec![assistant_msg("replacement")]);
+    assert_ne!(
+        snapshot.history_version(),
+        history.conversation_history_snapshot().history_version()
+    );
+}
+
+#[test]
+fn conversation_history_snapshot_excludes_contextual_user_messages() {
+    let contextual_message = crate::context::ContextualUserFragment::into(UserInstructions {
+        directory: None,
+        text: "Follow the repository instructions.".to_string(),
+    });
+    let user_message = user_input_text_msg("Review this repository.");
+    let assistant_message = assistant_msg("I will inspect the repository.");
+    let developer_message = developer_msg(
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nDeveloper context\n</INSTRUCTIONS>",
+    );
+    let history = create_history_with_items(vec![
+        contextual_message,
+        user_message.clone(),
+        assistant_message.clone(),
+        developer_message.clone(),
+    ]);
+    let snapshot = history.conversation_history_snapshot();
+
+    assert_eq!(
+        snapshot.items().cloned().collect::<Vec<_>>(),
+        vec![user_message, assistant_message, developer_message],
+    );
+}
+
+struct TestWorldStateSection;
+
+impl WorldStateSection for TestWorldStateSection {
+    const ID: &'static str = "test";
+    type Snapshot = bool;
+
+    fn snapshot(&self) -> Self::Snapshot {
+        true
+    }
+
+    fn matches_legacy_fragment(role: &str, text: &str) -> bool {
+        role == "user" && UserInstructions::matches_text(text)
+    }
+
+    fn render_diff(
+        &self,
+        previous: crate::context::world_state::PreviousSectionState<'_, Self::Snapshot>,
+    ) -> Option<Box<dyn crate::context::ContextualUserFragment>> {
+        let text = match previous {
+            crate::context::world_state::PreviousSectionState::Known(true) => return None,
+            crate::context::world_state::PreviousSectionState::Unknown => "unknown",
+            crate::context::world_state::PreviousSectionState::Absent
+            | crate::context::world_state::PreviousSectionState::Known(false) => "test",
+        };
+        Some(Box::new(UserInstructions {
+            directory: None,
+            text: text.to_string(),
+        })
+            as Box<dyn crate::context::ContextualUserFragment>)
+    }
+}
+
+#[test]
+fn world_state_baseline_deduplicates_until_history_is_replaced() {
+    let world_state = || {
+        let mut state = WorldState::default();
+        state.add_section(TestWorldStateSection);
+        state
+    };
+    let mut history = ContextManager::new();
+
+    let (initial_fragments, initial_item) = history.update_world_state(&world_state());
+    assert_eq!(1, initial_fragments.len());
+    assert!(initial_item.is_some_and(|item| item.full));
+
+    let (unchanged_fragments, unchanged_item) = history.update_world_state(&world_state());
+    assert!(unchanged_fragments.is_empty());
+    assert_eq!(unchanged_item, None);
+
+    history.replace(Vec::new());
+
+    let (replacement_fragments, replacement_item) = history.update_world_state(&world_state());
+    assert_eq!(1, replacement_fragments.len());
+    assert!(replacement_item.is_some_and(|item| item.full));
+}
+
+#[test]
+fn world_state_reconciles_matching_legacy_history_once() {
+    let item = crate::context::ContextualUserFragment::into(UserInstructions {
+        directory: None,
+        text: "legacy".to_string(),
+    });
+    let mut history = create_history_with_items(vec![item]);
+    let mut world_state = WorldState::default();
+    world_state.add_section(TestWorldStateSection);
+
+    let (fragments, rollout_item) = history.update_world_state(&world_state);
+    assert_eq!(
+        vec!["\n\n<INSTRUCTIONS>\nunknown\n"],
+        fragments
+            .into_iter()
+            .map(|fragment| fragment.body())
+            .collect::<Vec<_>>()
+    );
+    assert!(rollout_item.is_some_and(|item| item.full));
+
+    let (fragments, rollout_item) = history.update_world_state(&world_state);
+    assert!(fragments.is_empty());
+    assert_eq!(rollout_item, None);
+}
+
 fn user_msg(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -81,7 +264,7 @@ fn user_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     }
 }
 
@@ -93,7 +276,7 @@ fn user_input_text_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     }
 }
 
@@ -105,7 +288,7 @@ fn developer_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
     }
 }
 
@@ -120,7 +303,10 @@ fn developer_msg_with_fragments(texts: &[&str]) -> ResponseItem {
             })
             .collect(),
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            content_item_kinds: Some(vec![ContentItemKind("unknown".to_string()); texts.len()]),
+            ..Default::default()
+        }),
     }
 }
 
@@ -137,8 +323,10 @@ fn reference_context_item() -> TurnContextItem {
         current_date: Some("2026-03-23".to_string()),
         timezone: Some("America/Los_Angeles".to_string()),
         approval_policy: AskForApproval::OnRequest,
+        approvals_reviewer: None,
         sandbox_policy: SandboxPolicy::new_read_only_policy(),
         permission_profile: None,
+        active_permission_profile: None,
         network: None,
         file_system_sandbox_policy: None,
         model: "gpt-test".to_string(),
@@ -148,6 +336,7 @@ fn reference_context_item() -> TurnContextItem {
         multi_agent_version: None,
         multi_agent_mode: None,
         realtime_active: Some(false),
+        cyber_access_program: None,
         effort: None,
         summary: codex_protocol::config_types::ReasoningSummary::Auto,
     }
@@ -159,7 +348,7 @@ fn custom_tool_call_output(call_id: &str, output: &str) -> ResponseItem {
         call_id: call_id.to_string(),
         name: None,
         output: FunctionCallOutputPayload::from_text(output.to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -173,7 +362,7 @@ fn reasoning_msg(text: &str) -> ResponseItem {
             text: text.to_string(),
         }]),
         encrypted_content: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -185,7 +374,7 @@ fn reasoning_with_encrypted_content(len: usize) -> ResponseItem {
         }],
         content: None,
         encrypted_content: Some("a".repeat(len)),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -209,7 +398,7 @@ fn filters_non_api_messages() {
             text: "ignored".to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let reasoning = reasoning_msg("thinking...");
     h.record_items([&system, &reasoning, &ResponseItem::Other], policy);
@@ -219,41 +408,7 @@ fn filters_non_api_messages() {
     let a = assistant_msg("hello");
     h.record_items([&u, &a], policy);
 
-    let items = h.raw_items();
-    assert_eq!(
-        items,
-        vec![
-            ResponseItem::Reasoning {
-                id: None,
-                summary: vec![ReasoningItemReasoningSummary::SummaryText {
-                    text: "summary".to_string(),
-                }],
-                content: Some(vec![ReasoningItemContent::ReasoningText {
-                    text: "thinking...".to_string(),
-                }]),
-                encrypted_content: None,
-                metadata: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "hi".to_string()
-                }],
-                phase: None,
-                metadata: None,
-            },
-            ResponseItem::Message {
-                id: None,
-                role: "assistant".to_string(),
-                content: vec![ContentItem::OutputText {
-                    text: "hello".to_string()
-                }],
-                phase: None,
-                metadata: None,
-            }
-        ]
-    );
+    assert_eq!(raw_items(&h), vec![reasoning, u, a]);
 }
 
 #[test]
@@ -293,7 +448,6 @@ fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
     assert_eq!(
         history
             .items_after_last_model_generated_item()
-            .iter()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add),
         expected_tokens
@@ -307,7 +461,6 @@ fn items_after_last_model_generated_tokens_are_zero_without_model_generated_item
     assert_eq!(
         history
             .items_after_last_model_generated_item()
-            .iter()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add),
         0
@@ -326,8 +479,109 @@ fn for_prompt_preserves_inter_agent_assistant_messages() {
     let item = inter_agent_assistant_msg("continue");
     let history = create_history_with_items(vec![item.clone()]);
 
-    assert_eq!(history.raw_items(), std::slice::from_ref(&item));
+    assert_eq!(raw_items(&history), std::slice::from_ref(&item));
     assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+}
+
+#[test]
+fn cloned_history_shares_items_until_mutated() {
+    let first = assistant_msg(&"first ".repeat(1_024));
+    let second = assistant_msg("second");
+    let history = create_history_with_items(vec![first.clone()]);
+    let mut snapshot = history.clone();
+
+    assert!(std::ptr::eq(
+        history.annotated_items().as_ptr(),
+        snapshot.annotated_items().as_ptr()
+    ));
+
+    snapshot.record_items(
+        std::slice::from_ref(&second),
+        TruncationPolicy::Tokens(10_000),
+    );
+
+    assert!(!std::ptr::eq(
+        history.annotated_items().as_ptr(),
+        snapshot.annotated_items().as_ptr()
+    ));
+    assert_eq!(raw_items(&history), std::slice::from_ref(&first));
+    assert_eq!(raw_items(&snapshot), &[first, second]);
+}
+
+#[test]
+fn annotated_history_apis_preserve_envelopes() {
+    let first_item = assistant_msg("first");
+    let first_envelope = ResponseItemEnvelope {
+        item: first_item.clone(),
+        metadata: Some(CodexHarnessMetadata::default()),
+    };
+    let mut history = ContextManager::new();
+
+    history.replace_annotated(vec![first_envelope.clone()]);
+
+    assert_eq!(
+        history.annotated_items(),
+        std::slice::from_ref(&first_envelope)
+    );
+    assert_eq!(history.into_raw_items(), vec![first_item]);
+}
+
+#[test]
+fn record_annotated_items_preserves_metadata_while_processing_item() {
+    let envelope = ResponseItemEnvelope {
+        item: ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("word ".repeat(100)),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::default()),
+    };
+    let mut history = ContextManager::new();
+
+    history.record_annotated_items(std::slice::from_ref(&envelope), TruncationPolicy::Tokens(4));
+
+    assert_eq!(history.annotated_items().len(), 1);
+    assert_eq!(
+        history.annotated_items()[0].metadata,
+        Some(CodexHarnessMetadata::default())
+    );
+    assert_ne!(history.annotated_items()[0].item, envelope.item);
+}
+
+#[test]
+fn for_prompt_annotated_preserves_metadata_while_normalizing_item() {
+    let envelope = ResponseItemEnvelope {
+        item: ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "keep".to_string(),
+                },
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,abc".to_string(),
+                    detail: None,
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        metadata: Some(CodexHarnessMetadata::default()),
+    };
+    let mut history = ContextManager::new();
+    history.replace_annotated(vec![envelope.clone()]);
+
+    let normalized = history.for_prompt_annotated(&[InputModality::Text]);
+
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0].metadata, envelope.metadata);
+    assert_ne!(normalized[0].item, envelope.item);
 }
 
 #[test]
@@ -345,7 +599,7 @@ fn drop_last_n_user_turns_treats_inter_agent_assistant_messages_as_instruction_t
 
     history.drop_last_n_user_turns(/*num_turns*/ 1);
 
-    assert_eq!(history.raw_items(), &vec![first_turn, first_reply]);
+    assert_eq!(raw_items(&history), vec![first_turn, first_reply]);
 }
 
 #[test]
@@ -382,7 +636,7 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
 }
 
 #[test]
-fn for_prompt_strips_images_when_model_does_not_support_images() {
+fn for_prompt_strips_media_when_model_does_not_support_it() {
     let items = vec![
         ResponseItem::Message {
             id: None,
@@ -395,12 +649,25 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     image_url: "https://example.com/img.png".to_string(),
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
+                ContentItem::InputAudio {
+                    audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+                },
                 ContentItem::InputText {
                     text: "caption".to_string(),
                 },
             ],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("user.text".to_string()),
+                        ContentItemKind("user.image".to_string()),
+                        ContentItemKind("user.audio".to_string()),
+                        ContentItemKind("user.text".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -408,11 +675,14 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "image result".to_string(),
@@ -421,16 +691,20 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     image_url: "https://example.com/result.png".to_string(),
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/mpeg;base64,YXVkaW8=".to_string(),
+                },
             ]),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
             name: "js_repl".to_string(),
+            namespace: None,
             input: "view_image".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCallOutput {
             id: None,
@@ -444,10 +718,14 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     image_url: "https://example.com/js-repl-result.png".to_string(),
                     detail: Some(DEFAULT_IMAGE_DETAIL),
                 },
+                FunctionCallOutputContentItem::InputAudio {
+                    audio_url: "data:audio/ogg;base64,YXVkaW8=".to_string(),
+                },
             ]),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
+    let fully_supported_items = items.clone();
     let history = create_history_with_items(items);
     let text_only_modalities = vec![InputModality::Text];
     let stripped = history.for_prompt(&text_only_modalities);
@@ -465,11 +743,25 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                         .to_string(),
                 },
                 ContentItem::InputText {
+                    text: "audio content omitted because you do not support audio input"
+                        .to_string(),
+                },
+                ContentItem::InputText {
                     text: "caption".to_string(),
                 },
             ],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("user.text".to_string()),
+                        ContentItemKind("images.unsupported".to_string()),
+                        ContentItemKind("audio.unsupported".to_string()),
+                        ContentItemKind("user.text".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -477,11 +769,14 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputText {
                     text: "image result".to_string(),
@@ -490,16 +785,21 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     text: "image content omitted because you do not support image input"
                         .to_string(),
                 },
+                FunctionCallOutputContentItem::InputText {
+                    text: "audio content omitted because you do not support audio input"
+                        .to_string(),
+                },
             ]),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
             id: None,
             status: None,
             call_id: "tool-1".to_string(),
             name: "js_repl".to_string(),
+            namespace: None,
             input: "view_image".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCallOutput {
             id: None,
@@ -513,11 +813,23 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
                     text: "image content omitted because you do not support image input"
                         .to_string(),
                 },
+                FunctionCallOutputContentItem::InputText {
+                    text: "audio content omitted because you do not support audio input"
+                        .to_string(),
+                },
             ]),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     assert_eq!(stripped, expected);
+    assert_eq!(
+        create_history_with_items(fully_supported_items.clone()).for_prompt(&[
+            InputModality::Text,
+            InputModality::Image,
+            InputModality::Audio,
+        ]),
+        fully_supported_items
+    );
 
     // With image support, images are preserved
     let modalities = default_input_modalities();
@@ -534,7 +846,7 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
             },
         ],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }]);
     let preserved = with_images.for_prompt(&modalities);
     assert_eq!(preserved.len(), 1);
@@ -544,17 +856,32 @@ fn for_prompt_strips_images_when_model_does_not_support_images() {
     } else {
         panic!("expected Message");
     }
+
+    let audio_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputAudio {
+            audio_url: "data:audio/wav;base64,YXVkaW8=".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
+    };
+    let with_audio = create_history_with_items(vec![audio_message.clone()]);
+    assert_eq!(
+        with_audio.for_prompt(&[InputModality::Text, InputModality::Audio]),
+        vec![audio_message]
+    );
 }
 
 #[test]
 fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
     let history = create_history_with_items(vec![
         ResponseItem::ImageGenerationCall {
-            id: Some("ig_123".to_string()),
+            id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "generating".to_string(),
             revised_prompt: Some("lobster".to_string()),
             result: "Zm9v".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
             id: None,
@@ -563,7 +890,7 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
                 text: "hi".to_string(),
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ]);
 
@@ -571,11 +898,11 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
         history.for_prompt(&default_input_modalities()),
         vec![
             ResponseItem::ImageGenerationCall {
-                id: Some("ig_123".to_string()),
+                id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "generating".to_string(),
                 revised_prompt: Some("lobster".to_string()),
                 result: "Zm9v".to_string(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::Message {
                 id: None,
@@ -584,7 +911,7 @@ fn for_prompt_preserves_image_generation_calls_when_images_are_supported() {
                     text: "hi".to_string(),
                 }],
                 phase: None,
-                metadata: None,
+                internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
             }
         ]
     );
@@ -600,14 +927,14 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
                 text: "generate a lobster".to_string(),
             }],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::ImageGenerationCall {
-            id: Some("ig_123".to_string()),
+            id: Some(ResponseItemId::with_suffix("ig", "123")),
             status: "completed".to_string(),
             revised_prompt: Some("lobster".to_string()),
             result: "Zm9v".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ]);
 
@@ -621,14 +948,14 @@ fn for_prompt_clears_image_generation_result_when_images_are_unsupported() {
                     text: "generate a lobster".to_string(),
                 }],
                 phase: None,
-                metadata: None,
+                internal_chat_message_metadata_passthrough: Some(unknown_content_metadata()),
             },
             ResponseItem::ImageGenerationCall {
-                id: Some("ig_123".to_string()),
+                id: Some(ResponseItemId::with_suffix("ig", "123")),
                 status: "completed".to_string(),
                 revised_prompt: Some("lobster".to_string()),
                 result: String::new(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -639,9 +966,11 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
     let history = create_history_with_items(vec![assistant_msg("hello from history")]);
     let short_base = BaseInstructions {
         text: "short".to_string(),
+        provenance: None,
     };
     let long_base = BaseInstructions {
         text: "x".repeat(1_000),
+        provenance: None,
     };
 
     let short_estimate = history
@@ -665,18 +994,21 @@ fn remove_first_item_removes_matching_output_for_function_call() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-1".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".to_string(),
+            call_id: Some("call-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
     h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[test]
@@ -684,9 +1016,11 @@ fn remove_first_item_removes_matching_call_for_output() {
     let items = vec![
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-2".to_string(),
+            call_id: Some("call-2".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -694,74 +1028,13 @@ fn remove_first_item_removes_matching_call_for_output() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call-2".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
     h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
-}
-
-#[test]
-fn replace_last_turn_images_replaces_tool_output_images() {
-    let items = vec![
-        user_input_text_msg("hi"),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::ContentItems(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,AAA".to_string(),
-                        detail: Some(DEFAULT_IMAGE_DETAIL),
-                    },
-                ]),
-                success: Some(true),
-            },
-            metadata: None,
-        },
-    ];
-    let mut history = create_history_with_items(items);
-
-    assert!(history.replace_last_turn_images("Invalid image"));
-
-    assert_eq!(
-        history.raw_items(),
-        vec![
-            user_input_text_msg("hi"),
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::ContentItems(vec![
-                        FunctionCallOutputContentItem::InputText {
-                            text: "Invalid image".to_string(),
-                        },
-                    ]),
-                    success: Some(true),
-                },
-                metadata: None,
-            },
-        ]
-    );
-}
-
-#[test]
-fn replace_last_turn_images_does_not_touch_user_images() {
-    let items = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image_url: "data:image/png;base64,AAA".to_string(),
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        }],
-        phase: None,
-        metadata: None,
-    }];
-    let mut history = create_history_with_items(items.clone());
-
-    assert!(!history.replace_last_turn_images("Invalid image"));
-    assert_eq!(history.raw_items(), items);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[test]
@@ -778,18 +1051,20 @@ fn remove_first_item_handles_local_shell_pair() {
                 env: None,
                 user: None,
             }),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-3".to_string(),
+            call_id: Some("call-3".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
     h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[test]
@@ -934,8 +1209,20 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
         assistant_msg("session prefix item"),
         user_input_text_msg("turn 1 user"),
         assistant_msg("turn 1 assistant"),
-        developer_msg("Generated images are saved to /tmp as /tmp/image-1.png by default."),
+        developer_msg(
+            "<managed_developer_instructions>\nROLLED_BACK_MANAGED_INSTRUCTIONS\n</managed_developer_instructions>",
+        ),
+        developer_msg(&format!(
+            "{APPS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_APPS_INSTRUCTIONS"
+        )),
+        developer_msg(&format!(
+            "{PLUGINS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_PLUGIN_INSTRUCTIONS"
+        )),
+        developer_msg(&format!(
+            "{ENVIRONMENTS_INSTRUCTIONS_OPEN_TAG}\nROLLED_BACK_ENVIRONMENT_INSTRUCTIONS"
+        )),
         developer_msg("<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>"),
+        developer_msg("<multi_agent_role>ROLLED_BACK_MULTI_AGENT_ROLE</multi_agent_role>"),
         developer_msg("<multi_agent_mode>ROLLED_BACK_MULTI_AGENT_MODE</multi_agent_mode>"),
         user_input_text_msg(
             "<environment_context><cwd>PRETURN_CONTEXT_DIFF_CWD</cwd></environment_context>",
@@ -956,7 +1243,6 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
             assistant_msg("session prefix item"),
             user_input_text_msg("turn 1 user"),
             assistant_msg("turn 1 assistant"),
-            developer_msg("Generated images are saved to /tmp as /tmp/image-1.png by default."),
         ]
     );
     assert_eq!(
@@ -964,6 +1250,99 @@ fn drop_last_n_user_turns_trims_context_updates_above_rolled_back_turn() {
             .expect("serialize retained reference context item"),
         serde_json::to_value(Some(reference_context_item))
             .expect("serialize expected reference context item")
+    );
+}
+
+#[test]
+fn drop_last_n_user_turns_preserves_annotations_for_surviving_developer_fragments() {
+    let turn_id = "rolled-back-turn";
+    let model_switch = ModelSwitchInstructions::new("switched model instructions").render();
+    let developer_message = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "persistent developer instructions".to_string(),
+            },
+            ContentItem::InputText { text: model_switch },
+            ContentItem::InputText {
+                text: "<persistent_mode>\nFollow up on the completed task.\n</persistent_mode>"
+                    .to_string(),
+            },
+            ContentItem::InputText {
+                text: "persistent environment instructions".to_string(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
+            turn_id: Some(turn_id.to_string()),
+            content_item_kinds: Some(vec![
+                ContentItemKind("generic.developer_instructions".to_string()),
+                ContentItemKind("model_switch.instructions".to_string()),
+                ContentItemKind("persistent_mode.instructions".to_string()),
+                ContentItemKind("environments.instructions".to_string()),
+            ]),
+            ..Default::default()
+        }),
+    };
+    let mut user_message = user_input_text_msg("turn to roll back");
+    user_message.set_turn_id_if_missing(turn_id);
+    let mut history = create_history_with_items(vec![developer_message, user_message]);
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(
+        raw_items(&history),
+        vec![ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "persistent developer instructions".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "persistent environment instructions".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    turn_id: Some(turn_id.to_string()),
+                    content_item_kinds: Some(vec![
+                        ContentItemKind("generic.developer_instructions".to_string()),
+                        ContentItemKind("environments.instructions".to_string()),
+                    ]),
+                    ..Default::default()
+                },
+            ),
+        }],
+    );
+}
+
+#[test]
+fn drop_last_n_user_turns_trims_saved_prefix_update_above_rolled_back_turn() {
+    let items = vec![
+        assistant_msg("session prefix item"),
+        user_input_text_msg("turn 1 user"),
+        assistant_msg("turn 1 assistant"),
+        developer_msg(&format!(
+            "{APPROVED_COMMAND_PREFIX_SAVED_MESSAGE_PREFIX}\n- [\"touch\"]"
+        )),
+        user_input_text_msg("turn 2 user"),
+        assistant_msg("turn 2 assistant"),
+    ];
+
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(items);
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(
+        history.for_prompt(&modalities),
+        vec![
+            assistant_msg("session prefix item"),
+            user_input_text_msg("turn 1 user"),
+            assistant_msg("turn 1 assistant"),
+        ]
     );
 }
 
@@ -1006,20 +1385,21 @@ fn remove_first_item_handles_custom_tool_pair() {
             status: None,
             call_id: "tool-1".to_string(),
             name: "my_tool".to_string(),
+            namespace: None,
             input: "{}".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCallOutput {
             id: None,
             call_id: "tool-1".to_string(),
             name: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
     h.remove_first_item();
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[test]
@@ -1036,13 +1416,15 @@ fn normalization_retains_local_shell_outputs() {
                 env: None,
                 user: None,
             }),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "shell-1".to_string(),
+            call_id: Some("shell-1".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("Total output lines: 1\n\nok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
 
@@ -1062,12 +1444,14 @@ fn record_items_truncates_function_call_output_content() {
     let long_output = long_line.repeat(2_500);
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-100".to_string(),
+        call_id: Some("call-100".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(long_output.clone()),
             success: Some(true),
         },
-        metadata: Some(ResponseItemMetadata {
+        internal_chat_message_metadata_passthrough: Some(InternalChatMessageMetadataPassthrough {
             turn_id: Some("turn-1".to_string()),
             ..Default::default()
         }),
@@ -1076,7 +1460,7 @@ fn record_items_truncates_function_call_output_content() {
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
-    match &history.items[0] {
+    match &history.items[0].item {
         ResponseItem::FunctionCallOutput { output, .. } => {
             let content = output.text_content().unwrap_or_default();
             assert_ne!(content, long_output);
@@ -1105,13 +1489,13 @@ fn record_items_truncates_custom_tool_call_output_content() {
         call_id: "tool-200".to_string(),
         name: None,
         output: FunctionCallOutputPayload::from_text(long_output.clone()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     history.record_items([&item], policy);
 
     assert_eq!(history.items.len(), 1);
-    match &history.items[0] {
+    match &history.items[0].item {
         ResponseItem::CustomToolCallOutput { output, .. } => {
             let output = output.text_content().unwrap_or_default();
             assert_ne!(output, long_output);
@@ -1135,17 +1519,19 @@ fn record_items_respects_custom_token_limit() {
     let long_output = "tokenized content repeated many times ".repeat(200);
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-custom-limit".to_string(),
+        call_id: Some("call-custom-limit".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(long_output),
             success: Some(true),
         },
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     history.record_items([&item], policy);
 
-    let stored = match &history.items[0] {
+    let stored = match &history.items[0].item {
         ResponseItem::FunctionCallOutput { output, .. } => output,
         other => panic!("unexpected history item: {other:?}"),
     };
@@ -1260,14 +1646,15 @@ fn normalize_adds_missing_output_for_function_call() {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "call-x".to_string(),
-        metadata: None,
+        encrypted_function_args: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::FunctionCall {
                 id: None,
@@ -1275,13 +1662,16 @@ fn normalize_adds_missing_output_for_function_call() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
-                metadata: None,
+                encrypted_function_args: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "call-x".to_string(),
+                call_id: Some("call-x".to_string()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -1295,30 +1685,32 @@ fn normalize_adds_missing_output_for_custom_tool_call() {
         status: None,
         call_id: "tool-x".to_string(),
         name: "custom".to_string(),
+        namespace: None,
         input: "{}".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::CustomToolCall {
                 id: None,
                 status: None,
                 call_id: "tool-x".to_string(),
                 name: "custom".to_string(),
+                namespace: None,
                 input: "{}".to_string(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCallOutput {
                 id: None,
                 call_id: "tool-x".to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -1338,14 +1730,14 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
             env: None,
             user: None,
         }),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::LocalShellCall {
                 id: None,
@@ -1358,13 +1750,15 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
                     env: None,
                     user: None,
                 }),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "shell-1".to_string(),
+                call_id: Some("shell-1".to_string()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -1375,15 +1769,17 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id() {
 fn normalize_removes_orphan_function_call_output() {
     let items = vec![ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "orphan-1".to_string(),
+        call_id: Some("orphan-1".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[cfg(not(debug_assertions))]
@@ -1394,13 +1790,13 @@ fn normalize_removes_orphan_custom_tool_call_output() {
         call_id: "orphan-2".to_string(),
         name: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[cfg(not(debug_assertions))]
@@ -1414,14 +1810,17 @@ fn normalize_mixed_inserts_and_removals() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         // Orphan output that should be removed
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "c2".to_string(),
+            call_id: Some("c2".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         // Will get an inserted custom tool output
         ResponseItem::CustomToolCall {
@@ -1429,8 +1828,9 @@ fn normalize_mixed_inserts_and_removals() {
             status: None,
             call_id: "t1".to_string(),
             name: "tool".to_string(),
+            namespace: None,
             input: "{}".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         // Local shell call also gets an inserted function call output
         ResponseItem::LocalShellCall {
@@ -1444,7 +1844,7 @@ fn normalize_mixed_inserts_and_removals() {
                 env: None,
                 user: None,
             }),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
@@ -1452,7 +1852,7 @@ fn normalize_mixed_inserts_and_removals() {
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::FunctionCall {
                 id: None,
@@ -1460,28 +1860,32 @@ fn normalize_mixed_inserts_and_removals() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "c1".to_string(),
-                metadata: None,
+                encrypted_function_args: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "c1".to_string(),
+                call_id: Some("c1".to_string()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCall {
                 id: None,
                 status: None,
                 call_id: "t1".to_string(),
                 name: "tool".to_string(),
+                namespace: None,
                 input: "{}".to_string(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::CustomToolCallOutput {
                 id: None,
                 call_id: "t1".to_string(),
                 name: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::LocalShellCall {
                 id: None,
@@ -1494,13 +1898,15 @@ fn normalize_mixed_inserts_and_removals() {
                     env: None,
                     user: None,
                 }),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "s1".to_string(),
+                call_id: Some("s1".to_string()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -1514,12 +1920,13 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: "call-x".to_string(),
-        metadata: None,
+        encrypted_function_args: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::FunctionCall {
                 id: None,
@@ -1527,15 +1934,77 @@ fn normalize_adds_missing_output_for_function_call_inserts_output() {
                 namespace: None,
                 arguments: "{}".to_string(),
                 call_id: "call-x".to_string(),
-                metadata: None,
+                encrypted_function_args: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "call-x".to_string(),
+                call_id: Some("call-x".to_string()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
+    );
+}
+
+#[test]
+fn normalize_preserves_named_function_call_output_without_call_id() {
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("send_message_to_thread".to_string()),
+        namespace: Some("codex_app".to_string()),
+        output: FunctionCallOutputPayload::from_text("cross-thread message".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let history = create_history_with_items(vec![item.clone()]);
+
+    assert_eq!(history.for_prompt(&default_input_modalities()), vec![item]);
+}
+
+#[test]
+fn for_prompt_assigns_stable_id_to_synthetic_output_without_reordering_history() {
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::with_suffix("fc", "existing")),
+            name: "do_it".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-x".to_string(),
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: Some(ResponseItemId::with_suffix("msg", "later")),
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "later turn".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let first = create_history_with_items(items.clone()).for_prompt(&default_input_modalities());
+    let second = create_history_with_items(items).for_prompt(&default_input_modalities());
+
+    assert_eq!(
+        first, second,
+        "repeated prompt projections should assign the same ID to the synthetic output"
+    );
+    let [
+        ResponseItem::FunctionCall { .. },
+        ResponseItem::FunctionCallOutput { id: Some(id), .. },
+        ResponseItem::Message { .. },
+    ] = first.as_slice()
+    else {
+        panic!("expected the synthetic output between its call and the later message");
+    };
+    assert!(
+        id.starts_with("fco_"),
+        "the synthetic function call output should use the Responses API output ID prefix"
     );
 }
 
@@ -1547,14 +2016,14 @@ fn normalize_adds_missing_output_for_tool_search_call() {
         status: Some("completed".to_string()),
         execution: "client".to_string(),
         arguments: "{}".into(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![
             ResponseItem::ToolSearchCall {
                 id: None,
@@ -1562,7 +2031,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
                 status: Some("completed".to_string()),
                 execution: "client".to_string(),
                 arguments: "{}".into(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
             ResponseItem::ToolSearchOutput {
                 id: None,
@@ -1570,7 +2039,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
                 status: "completed".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
-                metadata: None,
+                internal_chat_message_metadata_passthrough: None,
             },
         ]
     );
@@ -1585,8 +2054,9 @@ fn normalize_adds_missing_output_for_custom_tool_call_panics_in_debug() {
         status: None,
         call_id: "tool-x".to_string(),
         name: "custom".to_string(),
+        namespace: None,
         input: "{}".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
@@ -1607,7 +2077,7 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() 
             env: None,
             user: None,
         }),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
@@ -1619,9 +2089,11 @@ fn normalize_adds_missing_output_for_local_shell_call_with_id_panics_in_debug() 
 fn normalize_removes_orphan_function_call_output_panics_in_debug() {
     let items = vec![ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "orphan-1".to_string(),
+        call_id: Some("orphan-1".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
@@ -1636,7 +2108,7 @@ fn normalize_removes_orphan_custom_tool_call_output_panics_in_debug() {
         call_id: "orphan-2".to_string(),
         name: None,
         output: FunctionCallOutputPayload::from_text("ok".to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
@@ -1651,13 +2123,13 @@ fn normalize_removes_orphan_client_tool_search_output() {
         status: "completed".to_string(),
         execution: "client".to_string(),
         tools: Vec::new(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
-    assert_eq!(h.raw_items(), vec![]);
+    assert_eq!(raw_items(&h), vec![]);
 }
 
 #[cfg(debug_assertions)]
@@ -1670,7 +2142,7 @@ fn normalize_removes_orphan_client_tool_search_output_panics_in_debug() {
         status: "completed".to_string(),
         execution: "client".to_string(),
         tools: Vec::new(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
     h.normalize_history(&default_input_modalities());
@@ -1684,21 +2156,21 @@ fn normalize_keeps_server_tool_search_output_without_matching_call() {
         status: "completed".to_string(),
         execution: "server".to_string(),
         tools: Vec::new(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let mut h = create_history_with_items(items);
 
     h.normalize_history(&default_input_modalities());
 
     assert_eq!(
-        h.raw_items(),
+        raw_items(&h),
         vec![ResponseItem::ToolSearchOutput {
             id: None,
             call_id: Some("server-search".to_string()),
             status: "completed".to_string(),
             execution: "server".to_string(),
             tools: Vec::new(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         }]
     );
 }
@@ -1714,21 +2186,25 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "c1".to_string(),
-            metadata: None,
+            encrypted_function_args: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "c2".to_string(),
+            call_id: Some("c2".to_string()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::CustomToolCall {
             id: None,
             status: None,
             call_id: "t1".to_string(),
             name: "tool".to_string(),
+            namespace: None,
             input: "{}".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::LocalShellCall {
             id: None,
@@ -1741,7 +2217,7 @@ fn normalize_mixed_inserts_and_removals_panics_in_debug() {
                 env: None,
                 user: None,
             }),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let mut h = create_history_with_items(items);
@@ -1765,7 +2241,7 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
             },
         ],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let text_only_item = ResponseItem::Message {
         id: None,
@@ -1774,7 +2250,7 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
             text: "Here is the screenshot".to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&image_item).unwrap().len() as i64;
@@ -1793,7 +2269,9 @@ fn image_data_url_payload_does_not_dominate_function_call_output_estimate() {
     let image_url = format!("data:image/png;base64,{payload}");
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-abc".to_string(),
+        call_id: Some("call-abc".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputText {
                 text: "Screenshot captured".to_string(),
@@ -1803,7 +2281,7 @@ fn image_data_url_payload_does_not_dominate_function_call_output_estimate() {
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -1831,7 +2309,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -1840,6 +2318,127 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
+}
+
+#[test]
+fn audio_data_url_payload_does_not_dominate_message_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 801);
+    let item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputAudio { audio_url }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 2) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 800);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-audio".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputAudio { audio_url },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
+    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let item = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-custom-audio".to_string(),
+        name: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputAudio { audio_url },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(estimated < raw_len);
+}
+
+#[test]
+fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
+    let payload = "A".repeat(/*n*/ 100_000);
+    let audio_url = format!("data:audio/wav;base64,{payload}");
+    let fallback_bytes = approx_bytes_for_tokens(approx_token_count(&audio_url)) as i64;
+    let item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputAudio { audio_url }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+
+    assert_eq!(estimated, raw_len - payload.len() as i64 + fallback_bytes);
+}
+
+#[test]
+fn record_items_omits_audio_that_exceeds_the_output_budget() {
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("call-audio".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputAudio { audio_url },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = ContextManager::new();
+
+    history.record_items([&item], TruncationPolicy::Tokens(50));
+
+    assert_eq!(
+        raw_items(&history),
+        &[ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some("call-audio".to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "[omitted 1 audio items ...]".to_string(),
+                    },
+                ]),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }]
+    );
 }
 
 #[test]
@@ -1852,18 +2451,20 @@ fn non_base64_image_urls_are_unchanged() {
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let function_output_item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-1".to_string(),
+        call_id: Some("call-1".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url: "file:///tmp/foo.png".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     assert_eq!(
@@ -1881,13 +2482,15 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
     let encrypted_content = "A".repeat(1_868);
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-encrypted".to_string(),
+        call_id: Some("call-encrypted".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: encrypted_content.clone(),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -1896,6 +2499,23 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
+
+    let agent_message = InterAgentCommunication::new_encrypted(
+        AgentPath::root(),
+        AgentPath::root().join("worker").expect("valid worker path"),
+        Vec::new(),
+        encrypted_content.clone(),
+        /*trigger_turn*/ true,
+    )
+    .to_model_input_item();
+    let agent_raw_len = serde_json::to_string(&agent_message).unwrap().len() as i64;
+    let expected_agent = agent_raw_len - encrypted_content.len() as i64
+        + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
+
+    assert_eq!(
+        estimate_response_item_model_visible_bytes(&agent_message),
+        expected_agent
+    );
 }
 
 #[test]
@@ -1908,7 +2528,7 @@ fn data_url_without_base64_marker_is_unchanged() {
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     assert_eq!(
@@ -1923,14 +2543,16 @@ fn non_image_base64_data_url_is_unchanged() {
     let image_url = format!("data:application/octet-stream;base64,{payload}");
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-octet".to_string(),
+        call_id: Some("call-octet".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url,
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -1951,7 +2573,7 @@ fn mixed_case_data_url_markers_are_adjusted() {
             detail: Some(DEFAULT_IMAGE_DETAIL),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -1984,7 +2606,7 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
             },
         ],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -2012,14 +2634,16 @@ fn original_detail_images_scale_with_dimensions() {
     let image_url = format!("data:image/png;base64,{payload}");
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-original".to_string(),
+        call_id: Some("call-original".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url,
                 detail: Some(ImageDetail::Original),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -2044,14 +2668,16 @@ fn original_detail_images_are_capped_at_max_patch_count() {
     let image_url = format!("data:image/png;base64,{payload}");
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-original-capped".to_string(),
+        call_id: Some("call-original-capped".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url,
                 detail: Some(ImageDetail::Original),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -2079,14 +2705,16 @@ fn original_detail_webp_images_scale_with_dimensions() {
     let image_url = format!("data:image/webp;base64,{payload}");
     let item = ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: "call-original-webp".to_string(),
+        call_id: Some("call-original-webp".to_string()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_content_items(vec![
             FunctionCallOutputContentItem::InputImage {
                 image_url,
                 detail: Some(ImageDetail::Original),
             },
         ]),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
@@ -2102,10 +2730,10 @@ fn text_only_items_unchanged() {
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
-            text: "Hello world, this is a response.".to_string(),
+            text: "Hello, \"world\"!\nこんにちは".to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let estimated = estimate_response_item_model_visible_bytes(&item);

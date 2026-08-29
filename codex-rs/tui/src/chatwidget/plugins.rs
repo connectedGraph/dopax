@@ -42,6 +42,7 @@ pub(super) const ADD_MARKETPLACE_TAB_ID: &str = "add-marketplace";
 pub(super) struct PluginListFetchState {
     pub(super) cache_cwd: Option<PathBuf>,
     pub(super) in_flight_cwd: Option<PathBuf>,
+    pub(super) vertical_section_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,7 @@ impl ChatWidget {
             Err(err) => {
                 self.plugin_remote_sections_loading = false;
                 self.plugin_remote_sections_loaded = false;
+                self.plugins_fetch_state.vertical_section_requested = false;
                 if should_refresh_plugins_popup {
                     self.plugins_fetch_state.cache_cwd = None;
                     self.plugins_cache = PluginsCacheState::Failed(err.clone());
@@ -175,6 +177,7 @@ impl ChatWidget {
             .is_some();
         self.plugin_remote_sections_loading = false;
         self.plugin_remote_sections_loaded = true;
+        self.plugins_fetch_state.vertical_section_requested = false;
         let refreshed_response = match &mut self.plugins_cache {
             PluginsCacheState::Ready(response)
                 if self.plugins_fetch_state.cache_cwd.as_deref() == Some(cwd.as_path()) =>
@@ -212,6 +215,8 @@ impl ChatWidget {
         }
 
         self.plugins_fetch_state.in_flight_cwd = Some(cwd.clone());
+        self.plugins_fetch_state.vertical_section_requested =
+            !self.config.features.enabled(Feature::RemotePlugin);
         if self.plugins_fetch_state.cache_cwd.as_deref() != Some(cwd.as_path()) {
             self.plugins_cache = PluginsCacheState::Loading;
         }
@@ -245,6 +250,36 @@ impl ChatWidget {
             ));
     }
 
+    pub(crate) fn open_plugins_list(&mut self, cwd: PathBuf, response: PluginListResponse) {
+        if self.config.cwd.as_path() != cwd.as_path() {
+            return;
+        }
+
+        let response = match self.plugins_cache_for_current_cwd() {
+            PluginsCacheState::Ready(current_response) => current_response,
+            PluginsCacheState::Uninitialized
+            | PluginsCacheState::Loading
+            | PluginsCacheState::Failed(_) => response,
+        };
+        self.plugins_fetch_state.cache_cwd = Some(cwd);
+        self.plugins_cache = PluginsCacheState::Ready(response.clone());
+        let active_tab_id = self
+            .bottom_pane
+            .active_tab_id_for_active_view(PLUGINS_SELECTION_VIEW_ID)
+            .map(str::to_string)
+            .or_else(|| self.plugins_active_tab_id.clone())
+            .or_else(|| Some(ALL_PLUGINS_TAB_ID.to_string()));
+        self.plugins_active_tab_id = active_tab_id.clone();
+        let params =
+            self.plugins_popup_params(&response, active_tab_id, /*initial_selected_idx*/ None);
+        if !self
+            .bottom_pane
+            .replace_selection_view_if_active(PLUGINS_SELECTION_VIEW_ID, params)
+        {
+            self.open_plugins_popup(&response);
+        }
+    }
+
     pub(crate) fn open_marketplace_add_prompt(&mut self) {
         self.plugins_active_tab_id = Some(ADD_MARKETPLACE_TAB_ID.to_string());
         let tx = self.app_event_tx.clone();
@@ -268,7 +303,7 @@ impl ChatWidget {
                 });
             }),
         );
-        self.bottom_pane.show_view(Box::new(view));
+        self.bottom_pane.show_text_prompt(view);
     }
 
     pub(crate) fn open_marketplace_add_loading_popup(&mut self, _source: &str) {
@@ -918,11 +953,21 @@ impl ChatWidget {
     }
 
     fn plugin_install_auth_app_is_installed(&self, app_id: &str) -> bool {
-        self.connectors_for_mentions().is_some_and(|connectors| {
-            connectors
+        if !self.connectors_enabled() {
+            return false;
+        }
+
+        let connectors = &self.connectors;
+        connectors.installed_app_ids.contains(app_id)
+            || connectors
+                .partial_snapshot
                 .iter()
+                .chain(match &connectors.cache {
+                    super::connectors::ConnectorsCacheState::Ready(snapshot) => Some(snapshot),
+                    _ => None,
+                })
+                .flat_map(|snapshot| &snapshot.connectors)
                 .any(|connector| connector.id == app_id && connector.is_accessible)
-        })
     }
 
     fn finish_plugin_install_auth_flow(&mut self, abandoned: bool) {

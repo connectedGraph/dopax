@@ -82,8 +82,8 @@ const RENDER_CASES: &[RenderCase] = &[
     ),
     RenderCase::round_trips("file:///etc", PathConvention::Posix, "/etc"),
     RenderCase::round_trips("file:///tmp/", PathConvention::Posix, "/tmp/"),
-    RenderCase::round_trips("file:///C:/Project", PathConvention::Posix, "/C:/Project"),
-    RenderCase::round_trips("file:///C:", PathConvention::Posix, "/C:"),
+    RenderCase::renders_lossily("file:///C:/Project", PathConvention::Posix, "/C:/Project"),
+    RenderCase::renders_lossily("file:///C:", PathConvention::Posix, "/C:"),
     RenderCase::round_trips("file:///tmp/%E2%98%83", PathConvention::Posix, "/tmp/☃"),
     RenderCase::round_trips("file:///tmp/a%5Cb", PathConvention::Posix, "/tmp/a\\b"),
     RenderCase::round_trips(
@@ -135,7 +135,7 @@ const RENDER_CASES: &[RenderCase] = &[
     RenderCase::round_trips(
         "file:///d:/snowman/%E2%98%83",
         PathConvention::Windows,
-        r"d:\snowman\☃",
+        r"D:\snowman\☃",
     ),
     RenderCase::round_trips("file:///C:/tmp/", PathConvention::Windows, "C:\\tmp\\"),
     RenderCase::round_trips(
@@ -458,10 +458,24 @@ fn converts_absolute_api_paths_using_the_inferred_convention() {
             path.to_inferred_path_uri(),
             Some(PathUri::parse(expected_uri).expect("expected URI should parse")),
         );
+        assert_eq!(path.render_for_ui(), raw_path);
         assert_eq!(
             PathUri::try_from(path.clone()),
             path.to_path_uri(convention)
         );
+    }
+}
+
+#[test]
+fn ambiguous_absolute_api_paths_preserve_their_inferred_convention() {
+    for (raw_path, convention) in [
+        ("/C:/secret", PathConvention::Posix),
+        (r"\\localhost\share", PathConvention::Windows),
+    ] {
+        let path = LegacyAppPathString::from_string(raw_path);
+        let uri = PathUri::try_from(path.clone()).expect("absolute API path should convert");
+        assert_eq!(uri.infer_path_convention(), Some(convention));
+        assert_eq!(LegacyAppPathString::from(uri), path);
     }
 }
 
@@ -494,6 +508,23 @@ fn foreign_absolute_syntax_deserializes_without_host_interpretation() {
         assert_eq!(path.as_str(), raw_path);
         assert_eq!(path.infer_absolute_path_convention(), Some(convention));
     }
+}
+
+#[test]
+fn from_path_preserves_foreign_absolute_path_for_uri_conversion() {
+    #[cfg(not(windows))]
+    let (foreign_path, expected_uri) = (r"C:\Users\openai\share", "file:///C:/Users/openai/share");
+    #[cfg(windows)]
+    let (foreign_path, expected_uri) = ("/home/openai/share", "file:///home/openai/share");
+
+    let path: PathUri = LegacyAppPathString::from_path(std::path::Path::new(foreign_path))
+        .try_into()
+        .expect("foreign absolute path should convert");
+
+    assert_eq!(
+        path,
+        PathUri::parse(expected_uri).expect("valid expected URI")
+    );
 }
 
 #[test]

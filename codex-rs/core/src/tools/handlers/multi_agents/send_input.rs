@@ -1,7 +1,6 @@
 use super::*;
 use crate::agent::control::render_input_preview;
 use crate::tools::handlers::multi_agents_spec::create_send_input_tool_v1;
-use crate::turn_timing::now_unix_timestamp_ms;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -22,7 +21,10 @@ impl ToolExecutor<ToolInvocation> for Handler {
         )
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -53,7 +55,7 @@ impl Handler {
             session
                 .services
                 .agent_control
-                .ensure_v2_agent_loaded(resume_config, receiver_thread_id)
+                .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
                 .await
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
@@ -67,21 +69,34 @@ impl Handler {
                 .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
         }
         session
-            .send_event(
+            .emit_turn_item_started(
                 &turn,
-                CollabAgentInteractionBeginEvent {
-                    call_id: call_id.clone(),
-                    started_at_ms: now_unix_timestamp_ms(),
+                &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id.clone(),
+                    tool: CollabAgentTool::SendInput,
+                    status: CollabAgentToolCallStatus::InProgress,
                     sender_thread_id: session.thread_id,
-                    receiver_thread_id,
-                    prompt: prompt.clone(),
-                }
-                .into(),
+                    receiver_thread_ids: vec![receiver_thread_id],
+                    receiver_agents: Vec::new(),
+                    prompt: Some(prompt.clone()),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: Default::default(),
+                }),
             )
             .await;
         let agent_control = session.services.agent_control.clone();
         let result = agent_control
-            .send_input(receiver_thread_id, input_items)
+            .send_input(
+                receiver_thread_id,
+                input_items,
+                crate::TurnStartOptions {
+                    parent_turn_id: Some(turn.sub_id.clone()),
+                    root_turn_id: turn.turn_metadata_state.root_turn_id(),
+                    cyber_access_program: turn.cyber_access_program,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|err| collab_agent_error(receiver_thread_id, err));
         let status = session
@@ -90,19 +105,24 @@ impl Handler {
             .get_status(receiver_thread_id)
             .await;
         session
-            .send_event(
+            .emit_turn_item_completed(
                 &turn,
-                CollabAgentInteractionEndEvent {
-                    call_id,
-                    completed_at_ms: now_unix_timestamp_ms(),
+                TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                    id: call_id,
+                    tool: CollabAgentTool::SendInput,
+                    status: collab_tool_call_status(&status, Some(receiver_thread_id)),
                     sender_thread_id: session.thread_id,
-                    receiver_thread_id,
-                    receiver_agent_nickname: receiver_agent.agent_nickname,
-                    receiver_agent_role: receiver_agent.agent_role,
-                    prompt,
-                    status,
-                }
-                .into(),
+                    receiver_thread_ids: vec![receiver_thread_id],
+                    receiver_agents: vec![CollabAgentRef {
+                        thread_id: receiver_thread_id,
+                        agent_nickname: receiver_agent.agent_nickname,
+                        agent_role: receiver_agent.agent_role,
+                    }],
+                    prompt: Some(prompt),
+                    model: None,
+                    reasoning_effort: None,
+                    agents_states: [(receiver_thread_id, status)].into_iter().collect(),
+                }),
             )
             .await;
         let submission_id = result?;
@@ -132,7 +152,7 @@ pub(crate) struct SendInputResult {
 }
 
 impl ToolOutput for SendInputResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "send_input")
     }
 

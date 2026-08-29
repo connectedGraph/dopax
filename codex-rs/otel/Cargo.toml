@@ -17,7 +17,6 @@ chrono = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-string = { workspace = true }
 codex-api = { workspace = true }
-codex-app-server-protocol = { workspace = true }
 codex-protocol = { workspace = true }
 eventsource-stream = { workspace = true }
 gethostname = { workspace = true }
@@ -64,3 +63,9 @@ opentelemetry_sdk = { workspace = true, features = [
     "testing",
 ] }
 pretty_assertions = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler = { workspace = true }

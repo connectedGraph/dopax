@@ -1,7 +1,7 @@
+use super::analytics::ToolCallAnalytics;
 use super::*;
 use crate::tools::handlers::multi_agents_spec::create_interrupt_agent_tool_v2;
-use crate::turn_timing::now_unix_timestamp_ms;
-use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_tools::ToolSpec;
 
 pub(crate) struct Handler;
@@ -15,17 +15,23 @@ impl ToolExecutor<ToolInvocation> for Handler {
         create_interrupt_agent_tool_v2()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
-            handle_interrupt_agent(invocation)
-                .await
-                .map(boxed_tool_output)
+            let mut analytics =
+                ToolCallAnalytics::new(&invocation, CollabAgentTool::InterruptAgent);
+            let result = handle_interrupt_agent(invocation, &mut analytics).await;
+            analytics.finish(&result);
+            result.map(boxed_tool_output)
         })
     }
 }
 
 async fn handle_interrupt_agent(
     invocation: ToolInvocation,
+    analytics: &mut ToolCallAnalytics,
 ) -> Result<InterruptAgentResult, FunctionCallError> {
     let ToolInvocation {
         session,
@@ -37,6 +43,7 @@ async fn handle_interrupt_agent(
     let arguments = function_arguments(payload)?;
     let args: InterruptAgentArgs = parse_arguments(&arguments)?;
     let agent_id = resolve_agent_target(&session, &turn, &args.target).await?;
+    analytics.set_receiver(agent_id);
     let receiver_agent = session
         .services
         .agent_control
@@ -67,23 +74,29 @@ async fn handle_interrupt_agent(
         .interrupt_agent(agent_id)
         .await
     {
-        Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => Ok(()),
+        Ok(_) => Ok(()),
+        Err(err)
+            if matches!(
+                err.details(),
+                CodexErrorDetails::ThreadNotFound(_) | CodexErrorDetails::InternalAgentDied
+            ) =>
+        {
+            Ok(())
+        }
         Err(err) => Err(collab_agent_error(agent_id, err)),
     };
     result?;
-    session
-        .send_event(
-            &turn,
-            SubAgentActivityEvent {
-                event_id: call_id,
-                occurred_at_ms: now_unix_timestamp_ms(),
-                agent_thread_id: agent_id,
-                agent_path: receiver_agent_path,
-                kind: SubAgentActivityKind::Interrupted,
-            }
-            .into(),
-        )
-        .await;
+    emit_sub_agent_activity(
+        &session,
+        &turn,
+        SubAgentActivityItem {
+            id: call_id,
+            agent_thread_id: agent_id,
+            agent_path: receiver_agent_path,
+            kind: SubAgentActivityKind::Interrupted,
+        },
+    )
+    .await;
 
     Ok(InterruptAgentResult {
         previous_status: status,
@@ -108,7 +121,7 @@ pub(crate) struct InterruptAgentResult {
 }
 
 impl ToolOutput for InterruptAgentResult {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         tool_output_json_text(self, "interrupt_agent")
     }
 

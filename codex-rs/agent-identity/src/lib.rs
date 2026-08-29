@@ -10,6 +10,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::SecondsFormat;
 use chrono::Utc;
+use codex_http_client::HttpClient;
+use codex_http_client::HttpError;
 use codex_protocol::auth::PlanType as AuthPlanType;
 use codex_protocol::protocol::SessionSource;
 use crypto_box::SecretKey as Curve25519SecretKey;
@@ -18,6 +20,7 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
+use http::StatusCode;
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
@@ -119,7 +122,7 @@ pub struct AgentIdentityJwtClaims {
     pub agent_private_key: String,
     pub account_id: String,
     pub chatgpt_user_id: String,
-    pub email: String,
+    pub email: Option<String>,
     pub plan_type: AuthPlanType,
     pub chatgpt_account_is_fedramp: bool,
 }
@@ -167,12 +170,12 @@ struct RegisterAgentResponse {
 #[derive(Debug)]
 pub struct AgentIdentityRegistrationHttpError {
     operation: &'static str,
-    status: reqwest::StatusCode,
+    status: StatusCode,
     body: String,
 }
 
 impl AgentIdentityRegistrationHttpError {
-    fn new(operation: &'static str, status: reqwest::StatusCode, body: String) -> Self {
+    fn new(operation: &'static str, status: StatusCode, body: String) -> Self {
         Self {
             operation,
             status,
@@ -181,7 +184,7 @@ impl AgentIdentityRegistrationHttpError {
     }
 
     /// HTTP status returned by the registration endpoint.
-    pub fn status(&self) -> reqwest::StatusCode {
+    pub fn status(&self) -> StatusCode {
         self.status
     }
 }
@@ -212,7 +215,7 @@ fn is_retryable_registration_cause(cause: &(dyn StdError + 'static)) -> bool {
         return is_retryable_registration_status(error.status());
     }
 
-    if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+    if let Some(error) = cause.downcast_ref::<HttpError>() {
         if let Some(status) = error.status() {
             return is_retryable_registration_status(status);
         }
@@ -222,8 +225,8 @@ fn is_retryable_registration_cause(cause: &(dyn StdError + 'static)) -> bool {
     false
 }
 
-fn is_retryable_registration_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+fn is_retryable_registration_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 pub fn authorization_header_for_agent_task(
@@ -242,7 +245,7 @@ pub fn authorization_header_for_agent_task(
 }
 
 pub async fn fetch_agent_identity_jwks(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_jwt_base_url: &str,
 ) -> Result<JwkSet> {
     let response = client
@@ -310,7 +313,7 @@ pub fn sign_task_registration_payload(
 }
 
 pub async fn register_agent_task(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_authapi_base_url: &str,
     key: AgentIdentityKey<'_>,
 ) -> Result<String> {
@@ -353,7 +356,7 @@ pub async fn register_agent_task(
 }
 
 pub async fn register_agent_identity(
-    client: &reqwest::Client,
+    client: &HttpClient,
     agent_identity_authapi_base_url: &str,
     access_token: &str,
     is_fedramp_account: bool,
@@ -667,11 +670,31 @@ mod tests {
                 agent_private_key: "private-key".to_string(),
                 account_id: "account-id".to_string(),
                 chatgpt_user_id: "user-id".to_string(),
-                email: "user@example.com".to_string(),
+                email: Some("user@example.com".to_string()),
                 plan_type: AuthPlanType::Known(KnownPlan::Pro),
                 chatgpt_account_is_fedramp: false,
             }
         );
+    }
+
+    #[test]
+    fn decode_agent_identity_jwt_accepts_missing_email() {
+        let jwt = jwt_with_payload(serde_json::json!({
+            "iss": AGENT_IDENTITY_JWT_ISSUER,
+            "aud": AGENT_IDENTITY_JWT_AUDIENCE,
+            "iat": 1_700_000_000usize,
+            "exp": 4_000_000_000usize,
+            "agent_runtime_id": "agent-runtime-id",
+            "agent_private_key": "private-key",
+            "account_id": "account-id",
+            "chatgpt_user_id": "user-id",
+            "plan_type": "pro",
+            "chatgpt_account_is_fedramp": false,
+        }));
+
+        let claims = decode_agent_identity_jwt(&jwt, /*jwks*/ None).expect("JWT should decode");
+
+        assert_eq!(claims.email, None);
     }
 
     #[test]
@@ -707,7 +730,7 @@ mod tests {
             agent_private_key: "private-key".to_string(),
             account_id: "account-id".to_string(),
             chatgpt_user_id: "user-id".to_string(),
-            email: "user@example.com".to_string(),
+            email: Some("user@example.com".to_string()),
             plan_type: AuthPlanType::Known(KnownPlan::Pro),
             chatgpt_account_is_fedramp: false,
         };
@@ -739,7 +762,7 @@ mod tests {
             agent_private_key: "private-key".to_string(),
             account_id: "account-id".to_string(),
             chatgpt_user_id: "user-id".to_string(),
-            email: "user@example.com".to_string(),
+            email: Some("user@example.com".to_string()),
             plan_type: AuthPlanType::Known(KnownPlan::Pro),
             chatgpt_account_is_fedramp: false,
         };
@@ -917,12 +940,12 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
     fn retryable_registration_error_accepts_429_and_5xx() {
         let too_many_requests = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::TOO_MANY_REQUESTS,
             "rate limited".to_string(),
         ));
         let unavailable = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::SERVICE_UNAVAILABLE,
             "try later".to_string(),
         ));
 
@@ -934,7 +957,7 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
     fn retryable_registration_error_rejects_hard_failures() {
         let forbidden = anyhow::Error::new(AgentIdentityRegistrationHttpError::new(
             "agent registration",
-            reqwest::StatusCode::FORBIDDEN,
+            StatusCode::FORBIDDEN,
             "not allowed".to_string(),
         ));
         let malformed = anyhow::anyhow!("failed to sign registration request");

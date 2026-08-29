@@ -12,7 +12,12 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
-        for turn in turns {
+        let hidden_nested_review_turns = std::iter::once(/*value*/ false)
+            .chain(turns.windows(/*size*/ 2).map(|turns| {
+                crate::app_backtrack::is_hidden_nested_review_turn(&turns[0], &turns[1])
+            }))
+            .collect::<Vec<_>>();
+        for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
             let Turn {
                 id: turn_id,
                 items_view: _,
@@ -24,12 +29,21 @@ impl ChatWidget {
                 duration_ms,
             } = turn;
             if matches!(status, TurnStatus::InProgress) {
+                self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
                 self.on_task_started();
             }
             for item in items {
+                if hidden_nested_review_turn && matches!(item, ThreadItem::UserMessage { .. }) {
+                    continue;
+                }
                 self.replay_thread_item(item, turn_id.clone(), replay_kind);
             }
+            let status = if hidden_nested_review_turn {
+                TurnStatus::Completed
+            } else {
+                status
+            };
             if matches!(
                 status,
                 TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed
@@ -80,6 +94,8 @@ impl ChatWidget {
                 text,
                 phase,
                 memory_citation,
+                delivery,
+                ..
             } => {
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
@@ -103,7 +119,9 @@ impl ChatWidget {
                                 rollout_ids: citation.thread_ids,
                             }
                         }),
+                        delivery,
                     },
+                    &turn_id,
                     from_replay,
                 );
             }
@@ -112,13 +130,18 @@ impl ChatWidget {
                 summary, content, ..
             } => {
                 if from_replay {
-                    for delta in summary {
-                        self.on_agent_reasoning_delta(delta);
-                    }
-                    if self.config.show_raw_agent_reasoning {
-                        for delta in content {
-                            self.on_agent_reasoning_delta(delta);
+                    let reasoning_parts = summary.into_iter().chain(
+                        self.config
+                            .show_raw_agent_reasoning
+                            .then_some(content)
+                            .into_iter()
+                            .flatten(),
+                    );
+                    for (index, delta) in reasoning_parts.enumerate() {
+                        if index > 0 {
+                            self.on_reasoning_section_break();
                         }
+                        self.on_agent_reasoning_delta(delta);
                     }
                 }
                 self.on_agent_reasoning_final();
@@ -127,6 +150,32 @@ impl ChatWidget {
                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                 ..
             } => self.on_command_execution_started(item),
+            item @ ThreadItem::CommandExecution {
+                source: ExecCommandSource::Agent | ExecCommandSource::UnifiedExecStartup,
+                status:
+                    codex_app_server_protocol::CommandExecutionStatus::Completed
+                    | codex_app_server_protocol::CommandExecutionStatus::Failed,
+                ..
+            } if from_replay => {
+                if matches!(
+                    &item,
+                    ThreadItem::CommandExecution {
+                        status: codex_app_server_protocol::CommandExecutionStatus::Failed,
+                        ..
+                    }
+                ) {
+                    self.flush_completed_command_activity();
+                }
+                if !self.transcript.active_cell.as_ref().is_some_and(|cell| {
+                    cell.as_any()
+                        .downcast_ref::<ExecCell>()
+                        .is_some_and(ExecCell::is_active)
+                        || cell.as_any().is::<McpToolCallCell>()
+                }) {
+                    self.handle_command_execution_started_now(item.clone());
+                }
+                self.handle_command_execution_completed_now(item);
+            }
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,
@@ -138,25 +187,25 @@ impl ChatWidget {
                 ..
             } => self.on_mcp_tool_call_started(item),
             item @ ThreadItem::McpToolCall { .. } => self.on_mcp_tool_call_completed(item),
-            ThreadItem::WebSearch { id, query, action } => {
-                self.on_web_search_begin(id.clone());
+            ThreadItem::WebSearch(item) => {
+                self.on_web_search_begin(item.id.clone());
                 self.on_web_search_end(
-                    id,
-                    query,
-                    action.unwrap_or(codex_app_server_protocol::WebSearchAction::Other),
+                    item.id,
+                    item.query,
+                    item.action
+                        .unwrap_or(codex_app_server_protocol::WebSearchAction::Other),
                 );
             }
             ThreadItem::ImageView { id: _, path } => {
                 self.on_view_image_tool_call(path);
             }
-            ThreadItem::ImageGeneration {
-                id,
-                status,
-                revised_prompt,
-                saved_path,
-                ..
-            } => {
-                self.on_image_generation_end(id, status, revised_prompt, saved_path);
+            ThreadItem::ImageGeneration(item) => {
+                self.on_image_generation_end(
+                    item.id,
+                    item.status,
+                    item.revised_prompt,
+                    item.saved_path,
+                );
             }
             ThreadItem::EnteredReviewMode { review, .. } => {
                 if from_replay {
@@ -168,6 +217,26 @@ impl ChatWidget {
             }
             ThreadItem::ContextCompaction { .. } => {
                 self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+            }
+            ThreadItem::FunctionCallOutput {
+                name,
+                namespace,
+                output,
+                ..
+            } => {
+                if let Some((source_thread_id, prompt)) =
+                    crate::dynamic_tools::parse_delegated_tool_output(
+                        &name,
+                        namespace.as_deref(),
+                        &output,
+                    )
+                {
+                    self.add_to_history(history_cell::PrefixedWrappedHistoryCell::new(
+                        format!("Sent by Codex from task {source_thread_id}\n{prompt}"),
+                        "• ".dim(),
+                        "  ",
+                    ));
+                }
             }
             ThreadItem::HookPrompt { .. } => {}
             ThreadItem::CollabAgentToolCall {
@@ -193,7 +262,7 @@ impl ChatWidget {
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
             ThreadItem::DynamicToolCall { .. } => {}
-            ThreadItem::Sleep { .. } => {}
+            ThreadItem::Sleep(_) => {}
         }
 
         if matches!(replay_kind, Some(ReplayKind::ThreadSnapshot)) && turn_id.is_empty() {

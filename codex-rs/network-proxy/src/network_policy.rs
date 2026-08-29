@@ -1,4 +1,5 @@
 use crate::reasons::REASON_POLICY_DENIED;
+use crate::request_disconnect::NetworkRequestDisconnect;
 use crate::runtime::HostBlockDecision;
 use crate::runtime::HostBlockReason;
 use crate::state::NetworkProxyState;
@@ -26,6 +27,27 @@ pub enum NetworkProtocol {
     Socks5Tcp,
     Socks5Udp,
 }
+
+/// A completed network-policy audit decision without tenant or session identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkPolicyAuditEvent {
+    pub timestamp: String,
+    pub scope: String,
+    pub decision: String,
+    pub source: String,
+    pub reason: String,
+    pub protocol: NetworkProtocol,
+    pub host: String,
+    pub port: u16,
+    pub method: Option<String>,
+    pub client: Option<String>,
+    pub policy_override: bool,
+}
+
+/// Observes final network-policy decisions without delaying or altering enforcement.
+///
+/// Implementations must return immediately and treat notification delivery as best effort.
+pub type NetworkPolicyAuditObserver = Arc<dyn Fn(NetworkPolicyAuditEvent) + Send + Sync + 'static>;
 
 impl NetworkProtocol {
     pub const fn as_policy_protocol(self) -> &'static str {
@@ -84,6 +106,9 @@ pub struct NetworkPolicyRequest {
     pub method: Option<String>,
     pub command: Option<String>,
     pub exec_policy_hint: Option<String>,
+    pub execution_id: Option<String>,
+    /// Present only when the local HTTP transport can identify an abandoned request.
+    pub disconnect: Option<NetworkRequestDisconnect>,
 }
 
 pub struct NetworkPolicyRequestArgs {
@@ -118,6 +143,8 @@ impl NetworkPolicyRequest {
             method,
             command,
             exec_policy_hint,
+            execution_id: None,
+            disconnect: None,
         }
     }
 }
@@ -199,6 +226,7 @@ fn emit_non_domain_policy_decision_audit_event(
     args: BlockDecisionAuditEventArgs<'_>,
     decision: &'static str,
 ) {
+    let execution_id = state.execution_id();
     emit_policy_audit_event(
         state,
         PolicyAuditEventArgs {
@@ -211,6 +239,7 @@ fn emit_non_domain_policy_decision_audit_event(
             server_port: args.server_port,
             method: args.method,
             client_addr: args.client_addr,
+            execution_id: execution_id.as_deref(),
             policy_override: false,
         },
     );
@@ -226,16 +255,18 @@ struct PolicyAuditEventArgs<'a> {
     server_port: u16,
     method: Option<&'a str>,
     client_addr: Option<&'a str>,
+    execution_id: Option<&'a str>,
     policy_override: bool,
 }
 
 fn emit_policy_audit_event(state: &NetworkProxyState, args: PolicyAuditEventArgs<'_>) {
     let metadata = state.audit_metadata();
+    let timestamp = audit_timestamp();
     tracing::event!(
         target: AUDIT_TARGET,
         tracing::Level::INFO,
         event.name = POLICY_DECISION_EVENT_NAME,
-        event.timestamp = %audit_timestamp(),
+        event.timestamp = %timestamp,
         conversation.id = metadata.conversation_id.as_deref(),
         app.version = metadata.app_version.as_deref(),
         auth_mode = metadata.auth_mode.as_deref(),
@@ -254,8 +285,24 @@ fn emit_policy_audit_event(state: &NetworkProxyState, args: PolicyAuditEventArgs
         server.port = args.server_port,
         http.request.method = args.method.unwrap_or(DEFAULT_METHOD),
         client.address = args.client_addr.unwrap_or(DEFAULT_CLIENT_ADDRESS),
+        execution.id = args.execution_id,
         network.policy.override = args.policy_override,
     );
+    if let Some(observer) = &state.policy_audit_observer {
+        observer(NetworkPolicyAuditEvent {
+            timestamp,
+            scope: args.scope.to_string(),
+            decision: args.decision.to_string(),
+            source: args.source.to_string(),
+            reason: args.reason.to_string(),
+            protocol: args.protocol,
+            host: args.server_address.to_string(),
+            port: args.server_port,
+            method: args.method.map(str::to_string),
+            client: args.client_addr.map(str::to_string),
+            policy_override: args.policy_override,
+        });
+    }
 }
 
 fn audit_timestamp() -> String {
@@ -295,12 +342,20 @@ pub(crate) async fn evaluate_host_policy(
     decider: Option<&Arc<dyn NetworkPolicyDecider>>,
     request: &NetworkPolicyRequest,
 ) -> Result<NetworkDecision> {
+    let execution_id = state.execution_id();
     let host_decision = state.host_blocked(&request.host, request.port).await?;
     let (decision, policy_override) = match host_decision {
         HostBlockDecision::Allowed => (NetworkDecision::Allow, false),
         HostBlockDecision::Blocked(HostBlockReason::NotAllowed) => {
             if let Some(decider) = decider {
-                let decider_decision = map_decider_decision(decider.decide(request.clone()).await);
+                let mut request = request.clone();
+                if request.environment_id.is_none()
+                    && let Some(environment_id) = state.environment_id()
+                {
+                    request.environment_id = Some(environment_id.to_string());
+                }
+                request.execution_id = execution_id.clone();
+                let decider_decision = map_decider_decision(decider.decide(request).await);
                 let policy_override = matches!(decider_decision, NetworkDecision::Allow);
                 (decider_decision, policy_override)
             } else {
@@ -355,6 +410,7 @@ pub(crate) async fn evaluate_host_policy(
             server_port: request.port,
             method: request.method.as_deref(),
             client_addr: request.client_addr.as_deref(),
+            execution_id: execution_id.as_deref(),
             policy_override,
         },
     );
@@ -392,6 +448,7 @@ pub(crate) mod test_support {
     use tracing::Subscriber;
     use tracing::field::Field;
     use tracing::field::Visit;
+    use tracing::instrument::WithSubscriber;
     use tracing::span::Attributes;
     use tracing::span::Record;
     use tracing::subscriber::Interest;
@@ -516,8 +573,15 @@ pub(crate) mod test_support {
         Fut: Future<Output = T>,
     {
         let collector = EventCollector::default();
-        let _guard = tracing::subscriber::set_default(collector.clone());
-        let output = f().await;
+        // Keep tracing out of its single-subscriber fast path: concurrent tests
+        // without a subscriber can otherwise cache this callsite as disabled.
+        let _interest_dispatch = tracing::Dispatch::new(collector.clone());
+        let output = async {
+            tracing::callsite::rebuild_interest_cache();
+            f().await
+        }
+        .with_subscriber(collector.clone())
+        .await;
         let events = collector.events();
         (output, events)
     }
@@ -539,7 +603,6 @@ mod tests {
     use super::*;
     use crate::config::NetworkMode;
     use crate::config::NetworkProxyConfig;
-    use crate::config::NetworkProxySettings;
     use crate::reasons::REASON_DENIED;
     use crate::reasons::REASON_METHOD_NOT_ALLOWED;
     use crate::reasons::REASON_NOT_ALLOWED;
@@ -580,12 +643,12 @@ mod tests {
     }
 
     fn state_with_metadata(metadata: NetworkProxyAuditMetadata) -> NetworkProxyState {
-        let network = NetworkProxySettings {
+        let network = NetworkProxyConfig {
             enabled: true,
             mode: NetworkMode::Full,
-            ..NetworkProxySettings::default()
+            ..NetworkProxyConfig::default()
         };
-        let config = NetworkProxyConfig { network };
+        let config = network;
         let state = build_config_state(config, NetworkProxyConstraints::default()).unwrap();
         let reloader = Arc::new(StaticReloader {
             state: state.clone(),
@@ -612,8 +675,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn policy_audit_observer_receives_domain_and_non_domain_decisions() {
+        let mut state = network_proxy_state_for_policy(NetworkProxyConfig::default());
+        let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+        state.set_policy_audit_observer(Arc::new(move |event| {
+            captured_tx
+                .send(event)
+                .expect("observer should capture the policy decision");
+        }));
+        let decider: Arc<dyn NetworkPolicyDecider> =
+            Arc::new(|_request| async { NetworkDecision::Allow });
+        let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
+            protocol: NetworkProtocol::Http,
+            host: "example.com".to_string(),
+            port: 80,
+            environment_id: None,
+            client_addr: None,
+            method: None,
+            command: None,
+            exec_policy_hint: None,
+        });
+        evaluate_host_policy(&state, Some(&decider), &request)
+            .await
+            .expect("evaluate domain policy");
+        emit_block_decision_audit_event(
+            &state,
+            BlockDecisionAuditEventArgs {
+                source: NetworkDecisionSource::ModeGuard,
+                reason: REASON_METHOD_NOT_ALLOWED,
+                protocol: NetworkProtocol::Http,
+                server_address: "unix-socket",
+                server_port: 0,
+                method: Some("POST"),
+                client_addr: None,
+            },
+        );
+
+        let events: Vec<_> = captured_rx.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.scope.as_str(), event.decision.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("domain", "allow"), ("non_domain", "deny")]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_emits_domain_event_for_decider_allow_override() {
-        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+        let state = network_proxy_state_for_policy(NetworkProxyConfig::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let decider: Arc<dyn NetworkPolicyDecider> = Arc::new({
             let calls = calls.clone();
@@ -680,13 +790,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn evaluate_host_policy_emits_execution_id_for_baseline_allow() {
+        let state = network_proxy_state_for_policy({
+            let mut network = NetworkProxyConfig::default();
+            network.set_allowed_domains(vec!["example.com".to_string()]);
+            network
+        });
+        state.register_execution("token-baseline-allow", "local", "execution-baseline-allow");
+        let state = state
+            .for_execution_token("token-baseline-allow")
+            .expect("expected registered execution");
+        let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
+            protocol: NetworkProtocol::Http,
+            host: "example.com".to_string(),
+            port: 80,
+            environment_id: None,
+            client_addr: None,
+            method: None,
+            command: None,
+            exec_policy_hint: None,
+        });
+
+        let (decision, events) = capture_events(|| async {
+            evaluate_host_policy(&state, /*decider*/ None, &request)
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(decision, NetworkDecision::Allow);
+
+        let event = find_event_by_name(&events, POLICY_DECISION_EVENT_NAME)
+            .expect("expected policy decision audit event");
+        assert_eq!(event.field("network.policy.decision"), Some("allow"));
+        assert_eq!(
+            event.field("execution.id"),
+            Some("execution-baseline-allow")
+        );
+        assert_ne!(event.field("execution.id"), Some("token-baseline-allow"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_emits_domain_event_for_baseline_deny() {
         let state = network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings::default();
+            let mut network = NetworkProxyConfig::default();
             network.set_allowed_domains(vec!["example.com".to_string()]);
             network.set_denied_domains(vec!["blocked.com".to_string()]);
             network
         });
+        state.register_execution("token-baseline-deny", "local", "execution-baseline-deny");
+        let state = state
+            .for_execution_token("token-baseline-deny")
+            .expect("expected registered execution");
         let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
             protocol: NetworkProtocol::Http,
             host: "blocked.com".to_string(),
@@ -724,11 +878,13 @@ mod tests {
         assert_eq!(event.field("network.policy.override"), Some("false"));
         assert_eq!(event.field("http.request.method"), Some("GET"));
         assert_eq!(event.field("client.address"), Some("127.0.0.1:1234"));
+        assert_eq!(event.field("execution.id"), Some("execution-baseline-deny"));
+        assert_ne!(event.field("execution.id"), Some("token-baseline-deny"));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_emits_domain_event_for_decider_ask() {
-        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+        let state = network_proxy_state_for_policy(NetworkProxyConfig::default());
         let decider: Arc<dyn NetworkPolicyDecider> =
             Arc::new(|_req| async { NetworkDecision::ask(REASON_NOT_ALLOWED) });
         let request = NetworkPolicyRequest::new(NetworkPolicyRequestArgs {
@@ -815,7 +971,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn emit_block_decision_audit_event_emits_non_domain_event() {
-        let state = network_proxy_state_for_policy(NetworkProxySettings::default());
+        let state = network_proxy_state_for_policy(NetworkProxyConfig::default());
 
         let (_, events) = capture_events(|| async {
             emit_block_decision_audit_event(
@@ -864,7 +1020,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn evaluate_host_policy_still_denies_not_allowed_local_without_decider_override() {
         let state = network_proxy_state_for_policy({
-            let mut network = NetworkProxySettings::default();
+            let mut network = NetworkProxyConfig::default();
             network.set_allowed_domains(vec!["example.com".to_string()]);
             network.allow_local_binding = false;
             network

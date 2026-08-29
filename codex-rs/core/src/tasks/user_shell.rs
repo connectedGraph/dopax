@@ -14,6 +14,8 @@ use crate::exec::ExecCapturePolicy;
 use crate::exec::StdoutStream;
 use crate::exec::execute_exec_request;
 use crate::exec_env::create_env;
+use crate::exec_env::inject_apply_patch_env;
+use crate::exec_env::inject_session_id_env;
 use crate::sandboxing::ExecRequest;
 use crate::session::TurnInput;
 use crate::session::turn_context::TurnContext;
@@ -25,22 +27,21 @@ use crate::tools::runtimes::RuntimePathPrepends;
 use crate::tools::runtimes::apply_package_path_prepend;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::runtimes::strip_managed_proxy_env;
-use crate::turn_timing::now_unix_timestamp_ms;
 use crate::user_shell_command::user_shell_command_record_item;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
+use codex_protocol::items::CommandExecutionItem;
+use codex_protocol::items::CommandExecutionStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::ExecCommandBeginEvent;
-use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
-use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_sandboxing::SandboxType;
 use codex_shell_command::parse_command::parse_command;
+use codex_thread_store::PersistContext;
 
 use super::SessionTask;
-use super::SessionTaskContext;
 use super::SessionTaskResult;
 use crate::session::session::Session;
 use codex_protocol::models::PermissionProfile;
@@ -79,13 +80,13 @@ impl SessionTask for UserShellCommandTask {
 
     async fn run(
         self: Arc<Self>,
-        session: Arc<SessionTaskContext>,
+        session: Arc<Session>,
         turn_context: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         execute_user_shell_command(
-            session.clone_session(),
+            session,
             turn_context,
             self.command.clone(),
             cancellation_token,
@@ -121,7 +122,7 @@ pub(crate) async fn execute_user_shell_command(
             trace_id: turn_context.trace_id.clone(),
             started_at: turn_context.turn_timing_state.started_at_unix_secs().await,
             model_context_window: turn_context.model_context_window(),
-            collaboration_mode_kind: turn_context.collaboration_mode.mode,
+            collaboration_mode_kind: turn_context.mode(),
         });
         session.send_event(turn_context.as_ref(), event).await;
     }
@@ -157,10 +158,10 @@ pub(crate) async fn execute_user_shell_command(
         return;
     };
     let shell_snapshot_location = turn_environment.shell_snapshot(&cwd);
-    let mut exec_env_map = create_env(
-        &turn_context.config.permissions.shell_environment_policy,
-        Some(session.thread_id),
-    );
+    let shell_environment_policy = turn_environment.shell_environment_policy();
+    let mut exec_env_map = create_env(shell_environment_policy, Some(session.thread_id));
+    inject_session_id_env(&mut exec_env_map, session.session_id());
+    inject_apply_patch_env(&mut exec_env_map, &turn_context.config.features);
     if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
         strip_managed_proxy_env(&mut exec_env_map);
     }
@@ -168,11 +169,7 @@ pub(crate) async fn execute_user_shell_command(
         &display_command,
         environment_shell,
         shell_snapshot_location.as_ref(),
-        &turn_context
-            .config
-            .permissions
-            .shell_environment_policy
-            .r#set,
+        &shell_environment_policy.r#set,
         &mut exec_env_map,
     );
 
@@ -181,18 +178,25 @@ pub(crate) async fn execute_user_shell_command(
 
     let parsed_cmd = parse_command(&display_command);
     session
-        .send_event(
+        .emit_turn_item_started(
             turn_context.as_ref(),
-            EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
-                call_id: call_id.clone(),
+            &TurnItem::CommandExecution(CommandExecutionItem {
+                id: call_id.clone(),
+                plugin_id: None,
+                script_path: None,
                 process_id: None,
-                turn_id: turn_context.sub_id.clone(),
-                started_at_ms: now_unix_timestamp_ms(),
                 command: display_command.clone(),
                 cwd: cwd.clone().into(),
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::UserShell,
                 interaction_input: None,
+                status: CommandExecutionStatus::InProgress,
+                stdout: None,
+                stderr: None,
+                aggregated_output: None,
+                exit_code: None,
+                duration: None,
+                formatted_output: None,
             }),
         )
         .await;
@@ -203,6 +207,7 @@ pub(crate) async fn execute_user_shell_command(
         cwd: cwd.clone().into(),
         env: exec_env_map,
         exec_server_env_config: None,
+        exec_server_shell_snapshot: None,
         // `/shell` is the explicit full-access escape hatch, so it must not
         // inherit a managed proxy from the surrounding session or turn.
         network: None,
@@ -213,17 +218,19 @@ pub(crate) async fn execute_user_shell_command(
         capture_policy: ExecCapturePolicy::ShellTool,
         sandbox: SandboxType::None,
         windows_sandbox_policy_cwd: cwd.clone().into(),
-        windows_sandbox_workspace_roots: turn_context.config.effective_workspace_roots(),
+        windows_sandbox_workspace_roots: turn_context.effective_workspace_roots(),
         windows_sandbox_level: turn_context.windows_sandbox_level,
         windows_sandbox_private_desktop: turn_context
             .config
             .permissions
             .windows_sandbox_private_desktop,
-        permission_profile: permission_profile.clone(),
-        file_system_sandbox_policy: permission_profile.file_system_sandbox_policy(),
-        network_sandbox_policy: permission_profile.network_sandbox_policy(),
+        permission_profile,
         windows_sandbox_filesystem_overrides: None,
         arg0: None,
+        exec_server_sandbox: None,
+        exec_server_enforce_managed_network: false,
+        exec_server_managed_network: None,
+        exec_server_network_proxy: None,
     };
 
     let stdout_stream = Some(StdoutStream {
@@ -256,57 +263,57 @@ pub(crate) async fn execute_user_shell_command(
             )
             .await;
             session
-                .send_event(
+                .emit_turn_item_completed(
                     turn_context.as_ref(),
-                    EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                        call_id,
+                    TurnItem::CommandExecution(CommandExecutionItem {
+                        id: call_id,
+                        plugin_id: None,
+                        script_path: None,
                         process_id: None,
-                        turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone().into(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
-                        stdout: String::new(),
-                        stderr: aborted_message.clone(),
-                        aggregated_output: aborted_message.clone(),
-                        exit_code: -1,
-                        duration: Duration::ZERO,
-                        formatted_output: aborted_message,
-                        status: ExecCommandStatus::Failed,
+                        status: CommandExecutionStatus::Failed,
+                        stdout: Some(String::new()),
+                        stderr: Some(aborted_message.clone()),
+                        aggregated_output: Some(aborted_message.clone()),
+                        exit_code: Some(-1),
+                        duration: Some(Duration::ZERO),
+                        formatted_output: Some(aborted_message),
                     }),
                 )
                 .await;
         }
         Ok(Ok(output)) => {
             session
-                .send_event(
+                .emit_turn_item_completed(
                     turn_context.as_ref(),
-                    EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                        call_id: call_id.clone(),
+                    TurnItem::CommandExecution(CommandExecutionItem {
+                        id: call_id.clone(),
+                        plugin_id: None,
+                        script_path: None,
                         process_id: None,
-                        turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command.clone(),
                         cwd: cwd.clone().into(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
-                        stdout: output.stdout.text.clone(),
-                        stderr: output.stderr.text.clone(),
-                        aggregated_output: output.aggregated_output.text.clone(),
-                        exit_code: output.exit_code,
-                        duration: output.duration,
-                        formatted_output: format_exec_output_str(
-                            &output,
-                            turn_context.model_info.truncation_policy.into(),
-                        ),
                         status: if output.exit_code == 0 {
-                            ExecCommandStatus::Completed
+                            CommandExecutionStatus::Completed
                         } else {
-                            ExecCommandStatus::Failed
+                            CommandExecutionStatus::Failed
                         },
+                        stdout: Some(output.stdout.text.clone()),
+                        stderr: Some(output.stderr.text.clone()),
+                        aggregated_output: Some(output.aggregated_output.text.clone()),
+                        exit_code: Some(output.exit_code),
+                        duration: Some(output.duration),
+                        formatted_output: Some(format_exec_output_str(
+                            &output,
+                            turn_context.model_info().truncation_policy.into(),
+                        )),
                     }),
                 )
                 .await;
@@ -326,28 +333,28 @@ pub(crate) async fn execute_user_shell_command(
                 timed_out: false,
             };
             session
-                .send_event(
+                .emit_turn_item_completed(
                     turn_context.as_ref(),
-                    EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                        call_id,
+                    TurnItem::CommandExecution(CommandExecutionItem {
+                        id: call_id,
+                        plugin_id: None,
+                        script_path: None,
                         process_id: None,
-                        turn_id: turn_context.sub_id.clone(),
-                        completed_at_ms: now_unix_timestamp_ms(),
                         command: display_command,
                         cwd: cwd.into(),
                         parsed_cmd,
                         source: ExecCommandSource::UserShell,
                         interaction_input: None,
-                        stdout: exec_output.stdout.text.clone(),
-                        stderr: exec_output.stderr.text.clone(),
-                        aggregated_output: exec_output.aggregated_output.text.clone(),
-                        exit_code: exec_output.exit_code,
-                        duration: exec_output.duration,
-                        formatted_output: format_exec_output_str(
+                        status: CommandExecutionStatus::Failed,
+                        stdout: Some(exec_output.stdout.text.clone()),
+                        stderr: Some(exec_output.stderr.text.clone()),
+                        aggregated_output: Some(exec_output.aggregated_output.text.clone()),
+                        exit_code: Some(exec_output.exit_code),
+                        duration: Some(exec_output.duration),
+                        formatted_output: Some(format_exec_output_str(
                             &exec_output,
-                            turn_context.model_info.truncation_policy.into(),
-                        ),
-                        status: ExecCommandStatus::Failed,
+                            turn_context.model_info().truncation_policy.into(),
+                        )),
                     }),
                 )
                 .await;
@@ -368,6 +375,7 @@ async fn send_user_shell_error(session: &Session, turn_context: &TurnContext, me
         .send_event(
             turn_context,
             EventMsg::Error(ErrorEvent {
+                misalignment: None,
                 message: message.to_string(),
                 codex_error_info: None,
             }),
@@ -452,7 +460,9 @@ async fn persist_user_shell_output(
             .await;
         // Standalone shell turns can run before any regular user turn, so
         // explicitly materialize rollout persistence after recording output.
-        session.ensure_rollout_materialized().await;
+        session
+            .ensure_rollout_materialized(PersistContext::Standard)
+            .await;
         return;
     }
 

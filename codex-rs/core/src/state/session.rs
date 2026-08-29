@@ -1,6 +1,7 @@
 //! Session-wide mutable state.
 
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::ResponseItem;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use codex_history::ResponseItemEnvelope;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -25,6 +27,8 @@ use codex_utils_output_truncation::TruncationPolicy;
 /// Persistent, session-scoped state previously stored directly on `Session`.
 pub(crate) struct SessionState {
     pub(crate) session_configuration: SessionConfiguration,
+    /// Persisted origin of the session base instructions, when known.
+    pub(crate) base_instructions_provenance: Option<BaseInstructionsProvenance>,
     pub(crate) history: ContextManager,
     pub(crate) latest_rate_limits: Option<RateLimitSnapshot>,
     pub(crate) server_reasoning_included: bool,
@@ -47,17 +51,29 @@ pub(crate) struct SessionState {
 
 impl SessionState {
     /// Create a new session state mirroring previous `State::default()` semantics.
+    #[cfg(test)]
     pub(crate) fn new(session_configuration: SessionConfiguration) -> Self {
+        Self::new_with_auto_compact_window_ids(
+            session_configuration,
+            AutoCompactWindowIds::new_initial(),
+        )
+    }
+
+    pub(crate) fn new_with_auto_compact_window_ids(
+        session_configuration: SessionConfiguration,
+        auto_compact_window_ids: AutoCompactWindowIds,
+    ) -> Self {
         let history = ContextManager::new();
         Self {
             session_configuration,
+            base_instructions_provenance: None,
             history,
             latest_rate_limits: None,
             server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
-            auto_compact_window: AutoCompactWindow::new(),
+            auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             startup_prewarm: None,
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
@@ -100,12 +116,24 @@ impl SessionState {
         self.history.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_history(
         &mut self,
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
         self.history.replace(items);
+        self.history
+            .set_reference_context_item(reference_context_item);
+        self.auto_compact_window.clear_prefill();
+    }
+
+    pub(crate) fn replace_annotated_history(
+        &mut self,
+        items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+    ) {
+        self.history.replace_annotated(items);
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();
@@ -148,6 +176,14 @@ impl SessionState {
         self.auto_compact_window.snapshot()
     }
 
+    pub(crate) fn claim_token_budget_reminder(&mut self) -> bool {
+        self.auto_compact_window.claim_token_budget_reminder()
+    }
+
+    pub(crate) fn claim_auto_compact_fallback(&mut self) -> bool {
+        self.auto_compact_window.claim_auto_compact_fallback()
+    }
+
     pub(crate) fn auto_compact_window_number(&self) -> u64 {
         self.auto_compact_window.window_number()
     }
@@ -172,16 +208,14 @@ impl SessionState {
         self.auto_compact_window.request_new_context_window();
     }
 
-    pub(crate) fn start_new_context_window_if_requested(
-        &mut self,
-    ) -> Option<(u64, AutoCompactWindowIds)> {
-        if !self.auto_compact_window.take_new_context_window_request() {
-            return None;
-        }
+    pub(crate) fn take_new_context_window_request(&mut self) -> bool {
+        self.auto_compact_window.take_new_context_window_request()
+    }
 
+    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
         let window = self.auto_compact_window.advance();
         self.auto_compact_window.clear_prefill();
-        Some(window)
+        window
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
@@ -313,6 +347,9 @@ fn merge_rate_limit_fields(
     }
     if snapshot.individual_limit.is_none() {
         snapshot.individual_limit = previous.and_then(|prior| prior.individual_limit.clone());
+    }
+    if snapshot.spend_control_reached.is_none() {
+        snapshot.spend_control_reached = previous.and_then(|prior| prior.spend_control_reached);
     }
     if snapshot.plan_type.is_none() {
         snapshot.plan_type = previous.and_then(|prior| prior.plan_type);

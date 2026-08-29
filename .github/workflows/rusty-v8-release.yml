@@ -316,6 +316,7 @@ jobs:
           ref: v${{ needs.metadata.outputs.v8_version }}
           path: upstream-rusty-v8
           submodules: recursive
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -392,7 +393,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/rusty_v8_bazel.py stage-upstream-release-pair \
-            --source-root upstream-rusty-v8 \
+            --target-dir upstream-rusty-v8/target \
             --target "${TARGET}" \
             --output-dir "dist/${TARGET}" \
             --sandbox

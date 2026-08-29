@@ -1,5 +1,5 @@
-use codex_app_server_protocol::JSONRPCMessage;
-use codex_app_server_protocol::JSONRPCNotification;
+use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
 use pretty_assertions::assert_eq;
 
 use super::JsonRpcMessageDecoder;
@@ -49,4 +49,20 @@ fn rejects_oversized_plaintext_record() {
         Err(ExecServerError::Protocol(message))
             if message == "Noise relay plaintext record exceeds maximum length"
     ));
+}
+
+#[test]
+fn reassembles_many_messages_from_one_record() {
+    let message = JSONRPCMessage::Notification(JSONRPCNotification {
+        method: "small/test".to_string(),
+        params: None,
+    });
+    let framed = frame_jsonrpc_message(&message).expect("frame message");
+    let message_count = NOISE_RECORD_PLAINTEXT_LEN / framed.len();
+    let record = framed.repeat(message_count);
+
+    let mut decoder = JsonRpcMessageDecoder::default();
+    let decoded = decoder.push(&record).expect("decode record");
+
+    assert_eq!(decoded, vec![message; message_count]);
 }

@@ -1,22 +1,176 @@
+use codex_exec_server::CopyOptions;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::ExecutorFileSystemFuture;
+use codex_exec_server::FileMetadata;
+use codex_exec_server::FileSystemReadStream;
+use codex_exec_server::FileSystemResult;
+use codex_exec_server::FileSystemSandboxContext;
+use codex_exec_server::GetMetadataOptions;
 use codex_exec_server::LOCAL_FS;
+use codex_exec_server::ReadDirectoryEntry;
+use codex_exec_server::ReadFileOptions;
+use codex_exec_server::RemoveOptions;
+use codex_exec_server::WalkOptions;
+use codex_exec_server::WalkOutcome;
+use codex_exec_server::WriteFileOptions;
 use codex_git_utils::GitInfo;
 use codex_git_utils::GitSha;
+use codex_git_utils::SanitizedGitUrl;
 use codex_git_utils::collect_git_info;
-use codex_git_utils::get_git_repo_root_with_fs;
-use codex_git_utils::get_has_changes;
+use codex_git_utils::get_git_repo_root;
+use codex_git_utils::get_has_changes_in_repo;
 use codex_git_utils::git_diff_to_remote;
 use codex_git_utils::recent_commits;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_utils_path::normalize_for_path_comparison;
+use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::skip_if_sandbox;
+use pretty_assertions::assert_eq;
 use std::fs;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use tokio::process::Command;
+
+struct MetadataOverrideFileSystem {
+    path: PathUri,
+    replacement: Option<PathBuf>,
+    canonical_overrides: Vec<(PathUri, PathUri)>,
+}
+
+impl MetadataOverrideFileSystem {
+    fn unsupported<T>() -> FileSystemResult<T> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "operation is not used by Git root discovery",
+        ))
+    }
+}
+
+impl ExecutorFileSystem for MetadataOverrideFileSystem {
+    fn canonicalize<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, PathUri> {
+        Box::pin(async move {
+            if let Some((_, canonical)) = self
+                .canonical_overrides
+                .iter()
+                .find(|(source, _)| source.to_url() == path.to_url())
+            {
+                return Ok(canonical.clone());
+            }
+            LOCAL_FS.canonicalize(path, sandbox).await
+        })
+    }
+
+    fn read_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: ReadFileOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            #[cfg(unix)]
+            if path == &self.path
+                && let Some(replacement) = &self.replacement
+            {
+                let local_path = path.to_abs_path()?;
+                fs::remove_file(local_path.as_path())?;
+                std::os::unix::fs::symlink(replacement, local_path.as_path())?;
+            }
+            LOCAL_FS.read_file(path, options, sandbox).await
+        })
+    }
+
+    fn read_file_stream<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn write_file<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _contents: Vec<u8>,
+        _options: WriteFileOptions,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn create_directory<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _options: CreateDirectoryOptions,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn get_metadata<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: GetMetadataOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
+        Box::pin(async move {
+            if path == &self.path && self.replacement.is_none() {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected metadata failure",
+                ))
+            } else {
+                LOCAL_FS.get_metadata(path, options, sandbox).await
+            }
+        })
+    }
+
+    fn read_directory<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn walk<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _options: WalkOptions,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        _path: &'a PathUri,
+        _options: RemoveOptions,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { Self::unsupported() })
+    }
+
+    fn copy<'a>(
+        &'a self,
+        _source_path: &'a PathUri,
+        _destination_path: &'a PathUri,
+        _options: CopyOptions,
+        _sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { Self::unsupported() })
+    }
+}
 
 // Helper function to create a test git repository
 async fn create_test_git_repo(temp_dir: &TempDir) -> PathBuf {
@@ -253,7 +407,10 @@ async fn test_collect_git_info_with_remote() {
         .to_string();
 
     // Should have repository URL
-    assert_eq!(git_info.repository_url, Some(expected_remote));
+    assert_eq!(
+        git_info.repository_url,
+        Some(SanitizedGitUrl::try_from(expected_remote.as_str()).unwrap())
+    );
 }
 
 #[tokio::test]
@@ -312,14 +469,20 @@ async fn test_collect_git_info_with_branch() {
 #[tokio::test]
 async fn test_get_has_changes_non_git_directory_returns_none() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    assert_eq!(get_has_changes(temp_dir.path()).await, None);
+    assert_eq!(
+        get_has_changes_in_repo(temp_dir.path(), temp_dir.path()).await,
+        None
+    );
 }
 
 #[tokio::test]
 async fn test_get_has_changes_clean_repo_returns_false() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let repo_path = create_test_git_repo(&temp_dir).await;
-    assert_eq!(get_has_changes(&repo_path).await, Some(false));
+    assert_eq!(
+        get_has_changes_in_repo(&repo_path, &repo_path).await,
+        Some(false)
+    );
 }
 
 #[tokio::test]
@@ -328,7 +491,10 @@ async fn test_get_has_changes_with_tracked_change_returns_true() {
     let repo_path = create_test_git_repo(&temp_dir).await;
 
     fs::write(repo_path.join("test.txt"), "updated tracked file").expect("write tracked file");
-    assert_eq!(get_has_changes(&repo_path).await, Some(true));
+    assert_eq!(
+        get_has_changes_in_repo(&repo_path, &repo_path).await,
+        Some(true)
+    );
 }
 
 #[tokio::test]
@@ -337,7 +503,10 @@ async fn test_get_has_changes_with_untracked_change_returns_true() {
     let repo_path = create_test_git_repo(&temp_dir).await;
 
     fs::write(repo_path.join("new_file.txt"), "untracked").expect("write untracked file");
-    assert_eq!(get_has_changes(&repo_path).await, Some(true));
+    assert_eq!(
+        get_has_changes_in_repo(&repo_path, &repo_path).await,
+        Some(true)
+    );
 }
 
 #[cfg(unix)]
@@ -377,7 +546,10 @@ async fn test_get_has_changes_ignores_configured_hooks_path() {
 
     fs::write(repo_path.join("test.txt"), "test content").expect("refresh tracked file");
 
-    assert_eq!(get_has_changes(&repo_path).await, Some(false));
+    assert_eq!(
+        get_has_changes_in_repo(&repo_path, &repo_path).await,
+        Some(false)
+    );
     assert!(
         !marker_path.exists(),
         "metadata collection should not invoke configured hook directories"
@@ -488,16 +660,57 @@ async fn resolve_root_git_project_for_trust_returns_none_outside_repo() {
 }
 
 #[tokio::test]
-async fn get_git_repo_root_with_fs_detects_gitdir_pointer() {
+async fn resolve_root_git_project_for_trust_starts_at_parent_for_file() {
     let tmp = TempDir::new().expect("tempdir");
     let proj = tmp.path().join("proj");
     let nested = proj.join("nested");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(proj.join(".git"), "gitdir: /tmp/fake-worktree\n").unwrap();
+    let file = nested.join("file.txt");
+    std::fs::write(&file, "contents").unwrap();
 
     assert_eq!(
-        get_git_repo_root_with_fs(LOCAL_FS.as_ref(), &nested.abs()).await,
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &file.abs()).await,
         Some(proj.abs())
+    );
+}
+
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_ignores_metadata_errors() {
+    let tmp = TempDir::new().expect("tempdir");
+    let proj = tmp.path().join("proj");
+    let nested = proj.join("nested");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let fs = MetadataOverrideFileSystem {
+        path: PathUri::from_abs_path(&nested.join(".git").abs()),
+        replacement: None,
+        canonical_overrides: Vec::new(),
+    };
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(&fs, &nested.abs()).await,
+        Some(proj.abs())
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_supports_windows_namespace_paths() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(repo.join("nested")).unwrap();
+
+    let namespace_repo = PathBuf::from(format!(r"\\?\{}", repo.display()));
+    let namespace_nested = namespace_repo.join("nested");
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &namespace_nested.abs()).await,
+        Some(namespace_repo.abs())
     );
 }
 
@@ -511,12 +724,37 @@ async fn resolve_root_git_project_for_trust_regular_repo_returns_repo_root() {
         Some(repo_path.clone())
     );
     let nested = repo_path.join("sub/dir");
-    std::fs::create_dir_all(nested.as_path()).unwrap();
+    std::fs::create_dir_all(nested.join(".git")).unwrap();
+    assert_eq!(
+        get_git_repo_root(nested.as_path()),
+        Some(repo_path.as_path().to_path_buf())
+    );
     assert_eq!(
         resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested).await,
         Some(repo_path)
     );
 }
+
+fn write_linked_worktree_metadata(repo_root: &Path, worktree_root: &Path) -> PathBuf {
+    let worktree_git_dir = repo_root.join(".git/worktrees/feature-x");
+    std::fs::create_dir_all(&worktree_git_dir).unwrap();
+    std::fs::create_dir_all(worktree_root).unwrap();
+    std::fs::write(
+        worktree_root.join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .unwrap();
+    std::fs::write(
+        worktree_git_dir.join("gitdir"),
+        format!("{}\n", worktree_root.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(worktree_git_dir.join("commondir"), "../..\n").unwrap();
+    worktree_git_dir
+}
+
+#[path = "worktree_trust_tests.rs"]
+mod worktree_trust_tests;
 
 #[tokio::test]
 async fn resolve_root_git_project_for_trust_detects_worktree_and_returns_main_root() {
@@ -564,17 +802,9 @@ async fn resolve_root_git_project_for_trust_detects_worktree_and_returns_main_ro
 async fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git_command() {
     let tmp = TempDir::new().expect("tempdir");
     let repo_root = tmp.path().join("repo");
-    let common_dir = repo_root.join(".git");
-    let worktree_git_dir = common_dir.join("worktrees").join("feature-x");
     let worktree_root = tmp.path().join("wt");
-    std::fs::create_dir_all(&worktree_git_dir).unwrap();
-    std::fs::create_dir_all(&worktree_root).unwrap();
     std::fs::create_dir_all(worktree_root.join("nested")).unwrap();
-    std::fs::write(
-        worktree_root.join(".git"),
-        format!("gitdir: {}\n", worktree_git_dir.display()),
-    )
-    .unwrap();
+    write_linked_worktree_metadata(&repo_root, &worktree_root);
 
     let expected = repo_root.abs();
     let worktree_root = worktree_root.abs();
@@ -586,6 +816,85 @@ async fn resolve_root_git_project_for_trust_detects_worktree_pointer_without_git
     assert_eq!(
         resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested).await,
         Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_rejects_missing_worktree_metadata() {
+    let tmp = TempDir::new().expect("tempdir");
+    let trusted_root = tmp.path().join("trusted");
+    let attacker_root = tmp.path().join("attacker");
+    std::fs::create_dir_all(trusted_root.join(".git")).unwrap();
+    std::fs::create_dir_all(&attacker_root).unwrap();
+    std::fs::write(
+        attacker_root.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            trusted_root.join(".git/worktrees/missing").display()
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &attacker_root.abs()).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_rejects_mismatched_worktree_backlink() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_root = tmp.path().join("repo");
+    let worktree_root = tmp.path().join("worktree");
+    let other_root = tmp.path().join("other");
+    let worktree_git_dir = write_linked_worktree_metadata(&repo_root, &worktree_root);
+    std::fs::create_dir_all(&other_root).unwrap();
+    std::fs::write(
+        worktree_git_dir.join("gitdir"),
+        format!("{}\n", other_root.join(".git").display()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &worktree_root.abs()).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_rejects_mismatched_common_dir() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_root = tmp.path().join("repo");
+    let worktree_root = tmp.path().join("worktree");
+    let other_common_dir = tmp.path().join("other/.git");
+    let worktree_git_dir = write_linked_worktree_metadata(&repo_root, &worktree_root);
+    std::fs::create_dir_all(&other_common_dir).unwrap();
+    std::fs::write(
+        worktree_git_dir.join("commondir"),
+        format!("{}\n", other_common_dir.display()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &worktree_root.abs()).await,
+        None
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resolve_root_git_project_for_trust_rejects_symlinked_dot_git_file() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo_root = tmp.path().join("repo");
+    let worktree_root = tmp.path().join("worktree");
+    let attacker_root = tmp.path().join("attacker");
+    write_linked_worktree_metadata(&repo_root, &worktree_root);
+    std::fs::create_dir_all(&attacker_root).unwrap();
+    std::os::unix::fs::symlink(worktree_root.join(".git"), attacker_root.join(".git")).unwrap();
+
+    assert_eq!(
+        resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &attacker_root.abs()).await,
+        None
     );
 }
 
@@ -661,7 +970,9 @@ fn test_git_info_serialization() {
     let git_info = GitInfo {
         commit_hash: Some(GitSha::new("abc123def456")),
         branch: Some("main".to_string()),
-        repository_url: Some("https://github.com/example/repo.git".to_string()),
+        repository_url: Some(
+            SanitizedGitUrl::try_from("https://github.com/example/repo.git").unwrap(),
+        ),
     };
 
     let json = serde_json::to_string(&git_info).expect("Should serialize GitInfo");

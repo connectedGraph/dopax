@@ -1,16 +1,17 @@
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_core::config::RolloutBudgetConfig;
 use codex_features::Feature;
 use codex_model_provider_info::built_in_model_providers;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
-use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::mount_sse_sequence;
@@ -25,12 +26,16 @@ use std::time::Duration;
 use test_case::test_case;
 use tokio::time::timeout;
 
-const ROLLOUT_BUDGET: RolloutBudgetConfig = RolloutBudgetConfig {
-    limit_tokens: 100,
-    reminder_interval_tokens: 25,
-    sampling_token_weight: 1.0,
-    prefill_token_weight: 1.0,
-};
+const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
+
+fn rollout_budget() -> RolloutBudgetConfig {
+    RolloutBudgetConfig {
+        limit_tokens: 100,
+        reminder_at_remaining_tokens: vec![75, 50, 25],
+        sampling_token_weight: 1.0,
+        prefill_token_weight: 1.0,
+    }
+}
 
 fn rollout_budget_texts(request: &ResponsesRequest) -> Vec<String> {
     request
@@ -51,7 +56,11 @@ fn wire_request_contains(request: &wiremock::Request, text: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn adds_weighted_initial_and_periodic_reminders() -> Result<()> {
+#[test_case(None ; "weighted token usage")]
+#[test_case(Some(40.5) ; "provider budget units")]
+async fn adds_weighted_initial_and_threshold_reminders(
+    rollout_budget_units: Option<f64>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -69,7 +78,8 @@ async fn adds_weighted_initial_and_periodic_reminders() -> Result<()> {
                             "input_tokens_details": { "cached_tokens": 40 },
                             "output_tokens": 15,
                             "output_tokens_details": null,
-                            "total_tokens": 75
+                            "total_tokens": 75,
+                            "codex_rollout_budget_units": rollout_budget_units
                         }
                     }
                 }),
@@ -83,7 +93,7 @@ async fn adds_weighted_initial_and_periodic_reminders() -> Result<()> {
             config.rollout_budget = Some(RolloutBudgetConfig {
                 sampling_token_weight: 2.0,
                 prefill_token_weight: 0.5,
-                ..ROLLOUT_BUDGET
+                ..rollout_budget()
             });
         })
         .build(&server)
@@ -93,6 +103,7 @@ async fn adds_weighted_initial_and_periodic_reminders() -> Result<()> {
     test.submit_turn("second turn").await?;
 
     let requests = responses.requests();
+    assert!(requests[0].has_content_kinds(&["rollout_budget.remaining_tokens"]));
     assert_eq!(
         rollout_budget_texts(&requests[0]),
         vec![rollout_budget_message(/*remaining_tokens*/ 100)]
@@ -101,8 +112,61 @@ async fn adds_weighted_initial_and_periodic_reminders() -> Result<()> {
         rollout_budget_texts(&requests[1]),
         vec![
             rollout_budget_message(/*remaining_tokens*/ 100),
-            rollout_budget_message(/*remaining_tokens*/ 60),
+            rollout_budget_message(if rollout_budget_units.is_some() {
+                59
+            } else {
+                60
+            }),
         ]
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_provider_rollout_budget_units_fail_without_retry() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut completed = ev_completed_with_tokens("invalid-units", /*total_tokens*/ 11);
+    completed["response"]["usage"]["codex_rollout_budget_units"] = json!(-1.0);
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![ev_response_created("invalid-units"), completed])],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.rollout_budget = Some(rollout_budget());
+        })
+        .build(&server)
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "reject invalid provider budget units".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        error.message,
+        "Fatal error: response.completed usage.codex_rollout_budget_units must be finite and non-negative"
+    );
+    assert_eq!(error.codex_error_info, Some(CodexErrorInfo::Other));
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "invalid units should not retry"
     );
 
     Ok(())
@@ -128,7 +192,12 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
         |request: &wiremock::Request| wire_request_contains(request, ROOT_PROMPT),
         sse(vec![
             ev_response_created("root-1"),
-            ev_function_call(SPAWN_CALL_ID, "spawn_agent", &spawn_args),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
             ev_completed_with_tokens("root-1", /*total_tokens*/ 10),
         ]),
     )
@@ -171,7 +240,7 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
                 .features
                 .enable(Feature::MultiAgentV2)
                 .expect("test config should allow multi-agent v2");
-            config.rollout_budget = Some(ROLLOUT_BUDGET);
+            config.rollout_budget = Some(rollout_budget());
         })
         .build(&server)
         .await?;
@@ -186,9 +255,21 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
     .await;
     test.submit_turn(FOLLOW_UP_PROMPT).await?;
 
-    let request = follow_up.single_request();
+    let requests = follow_up
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request
+                .message_input_texts("user")
+                .iter()
+                .any(|text| text == FOLLOW_UP_PROMPT)
+        })
+        .collect::<Vec<_>>();
+    let [request] = requests.as_slice() else {
+        anyhow::bail!("expected 1 follow-up request, got {}", requests.len());
+    };
     assert_eq!(
-        rollout_budget_texts(&request).last(),
+        rollout_budget_texts(request).last(),
         Some(&rollout_budget_message(/*remaining_tokens*/ 50))
     );
 
@@ -196,7 +277,7 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exhausted_budget_aborts_current_and_later_turns() -> Result<()> {
+async fn exhausted_budget_fails_current_and_later_turns() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -218,8 +299,8 @@ async fn exhausted_budget_aborts_current_and_later_turns() -> Result<()> {
         .with_config(|config| {
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 30,
-                reminder_interval_tokens: 10,
-                ..ROLLOUT_BUDGET
+                reminder_at_remaining_tokens: vec![20, 10],
+                ..rollout_budget()
             });
         })
         .build(&server)
@@ -227,42 +308,48 @@ async fn exhausted_budget_aborts_current_and_later_turns() -> Result<()> {
 
     for prompt in ["exhaust the budget", "try another turn"] {
         test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }]))
             .await?;
 
-        let event = wait_for_event(&test.codex, |event| match event {
-            EventMsg::TurnAborted(_) => true,
-            EventMsg::TurnComplete(_) => {
-                panic!("exhausted budget completed the turn instead of aborting")
-            }
-            _ => false,
+        wait_for_event(&test.codex, |event| {
+            matches!(
+                event,
+                EventMsg::Error(error)
+                    if error.codex_error_info == Some(CodexErrorInfo::SessionBudgetExceeded)
+            )
         })
         .await;
-        let EventMsg::TurnAborted(abort) = event else {
-            unreachable!("event filter only accepts TurnAborted")
-        };
-        assert_eq!(abort.reason, TurnAbortReason::Interrupted);
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
     }
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[test_case(false ; "local")]
-#[test_case(true ; "remote_v2")]
-async fn compaction_budget_exhaustion_aborts_without_error_or_retry(remote_v2: bool) -> Result<()> {
+#[test_case(false, false ; "local token usage")]
+#[test_case(false, true ; "local provider units")]
+#[test_case(true, false ; "remote v2 token usage")]
+#[test_case(true, true ; "remote v2 provider units")]
+async fn compaction_budget_exhaustion_fails_without_retry(
+    remote_v2: bool,
+    provider_units: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    let mut completed = ev_completed_with_tokens(
+        "compact",
+        /*total_tokens*/ if provider_units { 1 } else { 10 },
+    );
+    if provider_units {
+        completed["response"]["usage"]["codex_rollout_budget_units"] = json!(10.0);
+    }
     let compact_response = if remote_v2 {
         sse(vec![
             json!({
@@ -272,54 +359,48 @@ async fn compaction_budget_exhaustion_aborts_without_error_or_retry(remote_v2: b
                     "encrypted_content": "encrypted-summary",
                 }
             }),
-            ev_completed_with_tokens("compact", /*total_tokens*/ 10),
+            completed,
         ])
     } else {
         sse(vec![
             ev_response_created("compact"),
             ev_assistant_message("compact-summary", "compact summary"),
-            ev_completed_with_tokens("compact", /*total_tokens*/ 10),
+            completed,
         ])
     };
     let responses = mount_sse_sequence(&server, vec![compact_response]).await;
-    let mut model_provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
-    model_provider.base_url = Some(format!("{}/v1", server.uri()));
-    model_provider.supports_websockets = false;
-    if !remote_v2 {
-        model_provider.name = "OpenAI-compatible test provider".to_string();
-    }
     let test = test_codex()
         .with_config(move |config| {
-            config.model_provider = model_provider;
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 10,
-                reminder_interval_tokens: 5,
-                ..ROLLOUT_BUDGET
+                reminder_at_remaining_tokens: vec![5],
+                ..rollout_budget()
             });
             if remote_v2 {
                 config
                     .features
                     .enable(Feature::RemoteCompactionV2)
                     .expect("test config should allow remote compaction v2");
+            } else {
+                config.model_provider.name = "OpenAI-compatible test provider".to_string();
             }
         })
         .build(&server)
         .await?;
 
     test.codex.submit(Op::Compact).await?;
-    let event = wait_for_event(&test.codex, |event| match event {
-        EventMsg::TurnAborted(_) => true,
-        EventMsg::Error(error) => panic!("budget exhaustion emitted an error: {}", error.message),
-        EventMsg::TurnComplete(_) => {
-            panic!("budget-exhausting compaction completed instead of aborting")
-        }
-        _ => false,
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::Error(error)
+                if error.codex_error_info == Some(CodexErrorInfo::SessionBudgetExceeded)
+        )
     })
     .await;
-    let EventMsg::TurnAborted(abort) = event else {
-        unreachable!("event filter only accepts TurnAborted")
-    };
-    assert_eq!(abort.reason, TurnAbortReason::Interrupted);
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
     assert_eq!(responses.requests().len(), 1, "compaction should not retry");
 
     Ok(())
@@ -354,8 +435,8 @@ async fn restates_the_current_remainder_after_compaction() -> Result<()> {
         .with_config(move |config| {
             config.model_provider = model_provider;
             config.rollout_budget = Some(RolloutBudgetConfig {
-                reminder_interval_tokens: 50,
-                ..ROLLOUT_BUDGET
+                reminder_at_remaining_tokens: vec![50],
+                ..rollout_budget()
             });
         })
         .build(&server)
@@ -409,8 +490,8 @@ async fn restates_the_current_remainder_after_rollback() -> Result<()> {
     let test = test_codex()
         .with_config(|config| {
             config.rollout_budget = Some(RolloutBudgetConfig {
-                reminder_interval_tokens: 50,
-                ..ROLLOUT_BUDGET
+                reminder_at_remaining_tokens: vec![50],
+                ..rollout_budget()
             });
         })
         .build(&server)

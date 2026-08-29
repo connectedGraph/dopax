@@ -23,6 +23,7 @@ use crate::metrics::STARTUP_PHASE_DURATION_METRIC;
 use crate::metrics::SessionMetricTagValues;
 use crate::metrics::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::TOOL_CALL_DURATION_METRIC;
+use crate::metrics::TURN_COST_MICROUSD_METRIC;
 use crate::metrics::TURN_TTFT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
@@ -32,23 +33,29 @@ use crate::metrics::runtime_metrics::RuntimeMetricsSummary;
 use crate::metrics::timer::Timer;
 use crate::provider::OtelProvider;
 use crate::sanitize_metric_tag_value;
+use crate::tool_result::ToolResultEvent;
+use crate::tool_result::emit_tool_result;
+use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::ToolName;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ToolResultLogConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use eventsource_stream::Event as StreamEvent;
 use eventsource_stream::EventStreamError as StreamError;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use reqwest::Error;
 use reqwest::Response;
-use std::borrow::Cow;
 use std::future::Future;
 use std::time::Duration;
 use std::time::Instant;
@@ -85,6 +92,9 @@ pub struct AuthEnvTelemetryMetadata {
 #[derive(Debug, Clone)]
 pub struct SessionTelemetryMetadata {
     pub(crate) conversation_id: ThreadId,
+    // Full canonical path when available; legacy nickname or thread ID otherwise.
+    // Keep this potentially user-chosen label on detailed logs, not trace-safe events.
+    pub(crate) agent_name: String,
     pub(crate) auth_mode: Option<String>,
     pub(crate) auth_env: AuthEnvTelemetryMetadata,
     pub(crate) account_id: Option<String>,
@@ -94,6 +104,8 @@ pub struct SessionTelemetryMetadata {
     pub(crate) session_source: String,
     pub(crate) model: String,
     pub(crate) slug: String,
+    pub(crate) service_tier: Option<String>,
+    pub(crate) model_reasoning_effort: Option<String>,
     pub(crate) log_user_prompts: bool,
     pub(crate) app_version: &'static str,
     pub(crate) terminal_type: String,
@@ -101,12 +113,18 @@ pub struct SessionTelemetryMetadata {
 
 #[derive(Debug, Clone)]
 pub struct SessionTelemetry {
+    tool_result_log_config: ToolResultLogConfig,
     pub(crate) metadata: SessionTelemetryMetadata,
     pub(crate) metrics: Option<MetricsClient>,
     pub(crate) metrics_use_metadata_tags: bool,
 }
 
 impl SessionTelemetry {
+    pub fn with_tool_result_log_config(mut self, config: ToolResultLogConfig) -> Self {
+        self.tool_result_log_config = config;
+        self
+    }
+
     pub fn with_auth_env(mut self, auth_env: AuthEnvTelemetryMetadata) -> Self {
         self.metadata.auth_env = auth_env;
         self
@@ -115,6 +133,16 @@ impl SessionTelemetry {
     pub fn with_model(mut self, model: &str, slug: &str) -> Self {
         self.metadata.model = model.to_owned();
         self.metadata.slug = slug.to_owned();
+        self
+    }
+
+    pub fn with_inference_request(
+        mut self,
+        service_tier: Option<&str>,
+        model_reasoning_effort: Option<&ReasoningEffort>,
+    ) -> Self {
+        self.metadata.service_tier = service_tier.map(str::to_owned);
+        self.metadata.model_reasoning_effort = model_reasoning_effort.map(ToString::to_string);
         self
     }
 
@@ -192,6 +220,21 @@ impl SessionTelemetry {
         }
     }
 
+    fn record_duration_ms_f64(&self, name: &str, duration_ms: f64, tags: &[(&str, &str)]) {
+        let res: MetricsResult<()> = (|| {
+            let Some(metrics) = &self.metrics else {
+                return Ok(());
+            };
+
+            let tags = self.tags_with_metadata(tags)?;
+            metrics.record_duration_ms_f64(name, duration_ms, &tags)
+        })();
+
+        if let Err(e) = res {
+            tracing::warn!("metrics duration [{name}] failed: {e}");
+        }
+    }
+
     /// Records a coarse startup phase for production latency breakdowns.
     pub fn record_startup_phase(
         &self,
@@ -228,6 +271,64 @@ impl SessionTelemetry {
             },
             log: {},
             trace: {},
+        );
+    }
+
+    pub fn record_turn_cost(
+        &self,
+        turn_id: &str,
+        estimated_usd: &str,
+        interrupted: bool,
+        speed: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) {
+        let (dollars, fractional) = estimated_usd.split_once('.').unwrap_or((estimated_usd, ""));
+        let fractional = fractional.as_bytes();
+        let fractional_precision = 6_usize;
+        let estimated_microusd = dollars.parse::<u64>().ok().and_then(|dollars| {
+            if !fractional.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let fractional_microusd = fractional
+                .iter()
+                .take(fractional_precision)
+                .fold(0_u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+                * 10_u64.pow(fractional_precision.saturating_sub(fractional.len()) as u32);
+            let round_up = fractional
+                .get(fractional_precision)
+                .is_some_and(|digit| *digit >= b'5');
+            let estimated_microusd = dollars
+                .checked_mul(1_000_000)?
+                .checked_add(fractional_microusd)?
+                .checked_add(u64::from(round_up))?;
+            i64::try_from(estimated_microusd).ok()
+        });
+        if let Some(estimated_microusd) = estimated_microusd {
+            let conversation_id = self.metadata.conversation_id.to_string();
+            let mut tags = vec![
+                ("turn.id", turn_id),
+                ("conversation.id", conversation_id.as_str()),
+                (
+                    "turn.interrupted",
+                    if interrupted { "true" } else { "false" },
+                ),
+            ];
+            if let Some(speed) = speed {
+                tags.push(("speed", speed));
+            }
+            if let Some(reasoning_effort) = reasoning_effort {
+                tags.push(("reasoning_effort", reasoning_effort));
+            }
+            self.counter(TURN_COST_MICROUSD_METRIC, estimated_microusd, &tags);
+        }
+        log_event!(
+            self,
+            event.name = "codex.turn_cost",
+            turn.id = turn_id,
+            usage.estimated_usd = estimated_usd,
+            turn.interrupted = interrupted,
+            speed = speed,
+            reasoning_effort = reasoning_effort,
         );
     }
 
@@ -344,8 +445,8 @@ impl SessionTelemetry {
         &'a self,
         tags: &'a [(&'a str, &'a str)],
     ) -> MetricsResult<Vec<(&'a str, &'a str)>> {
-        let mut merged = self.metadata_tag_refs()?;
-        merged.extend(tags.iter().copied());
+        let mut merged = tags.to_vec();
+        merged.extend(self.metadata_tag_refs()?);
         Ok(merged)
     }
 
@@ -377,9 +478,22 @@ impl SessionTelemetry {
         terminal_type: String,
         session_source: SessionSource,
     ) -> SessionTelemetry {
+        let agent_name = session_source
+            .get_agent_path()
+            .map(|path| path.to_string())
+            .or_else(|| session_source.get_nickname())
+            .unwrap_or_else(|| {
+                if session_source.is_non_root_agent() {
+                    conversation_id.to_string()
+                } else {
+                    AgentPath::ROOT.to_string()
+                }
+            });
         Self {
+            tool_result_log_config: ToolResultLogConfig::default(),
             metadata: SessionTelemetryMetadata {
                 conversation_id,
+                agent_name,
                 auth_mode: auth_mode.map(|m| m.to_string()),
                 auth_env: AuthEnvTelemetryMetadata::default(),
                 account_id,
@@ -389,6 +503,8 @@ impl SessionTelemetry {
                 session_source: session_source.to_string(),
                 model: model.to_owned(),
                 slug: slug.to_owned(),
+                service_tier: None,
+                model_reasoning_effort: None,
                 log_user_prompts,
                 app_version: env!("CARGO_PKG_VERSION"),
                 terminal_type,
@@ -422,6 +538,10 @@ impl SessionTelemetry {
                 handle_responses_span.record(
                     "gen_ai.usage.cache_read.input_tokens",
                     token_usage.cached_input(),
+                );
+                handle_responses_span.record(
+                    "gen_ai.usage.cache_write.input_tokens",
+                    token_usage.cache_write_input_tokens,
                 );
                 handle_responses_span
                     .record("gen_ai.usage.output_tokens", token_usage.output_tokens);
@@ -502,6 +622,7 @@ impl SessionTelemetry {
             /*cf_ray*/ None,
             /*auth_error*/ None,
             /*auth_error_code*/ None,
+            /*agent_identity_telemetry*/ None,
         );
 
         response
@@ -524,6 +645,7 @@ impl SessionTelemetry {
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
         auth_error_code: Option<&str>,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success = status.is_some_and(|code| (200..=299).contains(&code)) && error.is_none();
         let success_str = if success { "true" } else { "false" };
@@ -564,6 +686,8 @@ impl SessionTelemetry {
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
                 auth.error_code = auth_error_code,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -587,6 +711,7 @@ impl SessionTelemetry {
         cf_ray: Option<&str>,
         auth_error: Option<&str>,
         auth_error_code: Option<&str>,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success = error.is_none()
             && status
@@ -618,6 +743,8 @@ impl SessionTelemetry {
                 auth.cf_ray = cf_ray,
                 auth.error = auth_error,
                 auth.error_code = auth_error_code,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -629,6 +756,7 @@ impl SessionTelemetry {
         duration: Duration,
         error: Option<&str>,
         connection_reused: bool,
+        agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
     ) {
         let success_str = if error.is_none() { "true" } else { "false" };
         self.counter(
@@ -655,6 +783,8 @@ impl SessionTelemetry {
                 auth.env_provider_key_present = self.metadata.auth_env.provider_env_key_present,
                 auth.env_refresh_token_url_override_present = self.metadata.auth_env.refresh_token_url_override_present,
                 auth.connection_reused = connection_reused,
+                auth.agent_id = agent_identity_telemetry.map(|metadata| metadata.agent_id.as_str()),
+                auth.task_id = agent_identity_telemetry.map(|metadata| metadata.task_id.as_str()),
             },
             log: {},
             trace: {},
@@ -707,7 +837,6 @@ impl SessionTelemetry {
         duration: Duration,
     ) {
         let mut kind = None;
-        let mut error_message = None;
         let mut success = true;
 
         match result {
@@ -724,49 +853,26 @@ impl SessionTelemetry {
                             }
                             if kind.as_deref() == Some("response.failed") {
                                 success = false;
-                                error_message = value
-                                    .get("response")
-                                    .and_then(|value| value.get("error"))
-                                    .map(serde_json::Value::to_string)
-                                    .or_else(|| Some("response.failed event received".to_string()));
                             }
                         }
-                        Err(err) => {
+                        Err(_) => {
                             kind = Some("parse_error".to_string());
-                            error_message = Some(err.to_string());
                             success = false;
                         }
                     }
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(_) => {
-                    success = false;
-                    error_message = Some("unexpected binary websocket event".to_string());
                 }
                 tokio_tungstenite::tungstenite::Message::Ping(_)
                 | tokio_tungstenite::tungstenite::Message::Pong(_) => {
                     return;
                 }
-                tokio_tungstenite::tungstenite::Message::Close(_) => {
+                tokio_tungstenite::tungstenite::Message::Binary(_)
+                | tokio_tungstenite::tungstenite::Message::Close(_)
+                | tokio_tungstenite::tungstenite::Message::Frame(_) => {
                     success = false;
-                    error_message =
-                        Some("websocket closed by server before response.completed".to_string());
-                }
-                tokio_tungstenite::tungstenite::Message::Frame(_) => {
-                    success = false;
-                    error_message = Some("unexpected websocket frame".to_string());
                 }
             },
-            Ok(Some(Err(err))) => {
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
                 success = false;
-                error_message = Some(err.to_string());
-            }
-            Ok(None) => {
-                success = false;
-                error_message = Some("stream closed before response.completed".to_string());
-            }
-            Err(err) => {
-                success = false;
-                error_message = Some(err.to_string());
             }
         }
 
@@ -775,18 +881,6 @@ impl SessionTelemetry {
         let tags = [("kind", kind_str), ("success", success_str)];
         self.counter(WEBSOCKET_EVENT_COUNT_METRIC, /*inc*/ 1, &tags);
         self.record_duration(WEBSOCKET_EVENT_DURATION_METRIC, duration, &tags);
-        log_and_trace_event!(
-            self,
-            common: {
-                event.name = "codex.websocket_event",
-                event.kind = %kind_str,
-                duration_ms = %duration.as_millis(),
-                success = success_str,
-                error.message = error_message.as_deref(),
-            },
-            log: {},
-            trace: {},
-        );
     }
 
     pub fn log_sse_event<E>(
@@ -914,24 +1008,21 @@ impl SessionTelemetry {
         );
     }
 
-    pub fn sse_event_completed(
-        &self,
-        input_token_count: i64,
-        output_token_count: i64,
-        cached_token_count: Option<i64>,
-        reasoning_token_count: Option<i64>,
-        tool_token_count: i64,
-    ) {
+    pub fn sse_event_completed(&self, usage: &TokenUsage, ttft_ms: Option<i64>) {
         log_and_trace_event!(
             self,
             common: {
                 event.name = "codex.sse_event",
                 event.kind = %"response.completed",
-                input_token_count = %input_token_count,
-                output_token_count = %output_token_count,
-                cached_token_count = cached_token_count,
-                reasoning_token_count = reasoning_token_count,
-                tool_token_count = %tool_token_count,
+                input_token_count = %usage.input_tokens,
+                output_token_count = %usage.output_tokens,
+                cached_token_count = usage.cached_input_tokens,
+                cache_write_token_count = usage.cache_write_input_tokens,
+                reasoning_token_count = usage.reasoning_output_tokens,
+                tool_token_count = %usage.total_tokens,
+                ttft_ms = ttft_ms,
+                service_tier = self.metadata.service_tier.as_deref(),
+                model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
             },
             log: {},
             trace: {},
@@ -983,19 +1074,31 @@ impl SessionTelemetry {
 
     pub fn tool_decision(
         &self,
-        tool_name: &str,
+        tool_name: &ToolName,
         call_id: &str,
         decision: &ReviewDecision,
-        source: ToolDecisionSource,
+        source: Option<ToolDecisionSource>,
     ) {
-        log_event!(
-            self,
-            event.name = "codex.tool_decision",
-            tool_name = %tool_name,
-            call_id = %call_id,
-            decision = %decision.clone().to_string().to_lowercase(),
-            source = %source.to_string(),
-        );
+        let tool_namespace = crate::events::shared::tool_namespace(tool_name);
+        match source {
+            Some(source) => log_event!(
+                self,
+                event.name = "codex.tool_decision",
+                tool_name = %tool_name.name,
+                tool_namespace = %tool_namespace,
+                call_id = %call_id,
+                decision = %decision.to_opaque_string(),
+                source = %source.to_string(),
+            ),
+            None => log_event!(
+                self,
+                event.name = "codex.tool_decision",
+                tool_name = %tool_name.name,
+                tool_namespace = %tool_namespace,
+                call_id = %call_id,
+                decision = %decision.to_opaque_string(),
+            ),
+        }
     }
 
     pub fn sandbox_outcome(
@@ -1029,19 +1132,22 @@ impl SessionTelemetry {
         );
     }
 
+    /// Records a diagnostic representation and returns the original result. The temporary
+    /// output string is truncated and released before the caller resumes async work.
     #[allow(clippy::too_many_arguments)]
-    pub async fn log_tool_result_with_tags<F, Fut, E>(
+    pub async fn log_tool_result_with_tags<T, F, Fut, E>(
         &self,
-        tool_name: &str,
+        tool_name: &ToolName,
         call_id: &str,
         arguments: &str,
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
         f: F,
-    ) -> Result<(String, bool), E>
+        log_output: impl FnOnce(&T) -> (String, bool),
+    ) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(String, bool), E>>,
+        Fut: Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
         let start = Instant::now();
@@ -1049,8 +1155,8 @@ impl SessionTelemetry {
         let duration = start.elapsed();
 
         let (output, success) = match &result {
-            Ok((preview, success)) => (Cow::Borrowed(preview.as_str()), *success),
-            Err(error) => (Cow::Owned(error.to_string()), false),
+            Ok(result) => log_output(result),
+            Err(error) => (error.to_string(), false),
         };
 
         self.tool_result_with_tags(
@@ -1059,7 +1165,7 @@ impl SessionTelemetry {
             arguments,
             duration,
             success,
-            output.as_ref(),
+            &output,
             extra_tags,
             extra_trace_fields,
         );
@@ -1067,34 +1173,10 @@ impl SessionTelemetry {
         result
     }
 
-    pub fn log_tool_failed(&self, tool_name: &str, error: &str) {
-        log_event!(
-            self,
-            event.name = "codex.tool_result",
-            tool_name = %tool_name,
-            duration_ms = %Duration::ZERO.as_millis(),
-            success = %false,
-            output = %error,
-            mcp_server = "",
-            mcp_server_origin = "",
-        );
-        trace_event!(
-            self,
-            event.name = "codex.tool_result",
-            tool_name = %tool_name,
-            duration_ms = %Duration::ZERO.as_millis(),
-            success = %false,
-            output_length = error.len() as i64,
-            output_line_count = error.lines().count() as i64,
-            tool_origin = %"builtin",
-            error.message = %error,
-        );
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn tool_result_with_tags(
         &self,
-        tool_name: &str,
+        tool_name: &ToolName,
         call_id: &str,
         arguments: &str,
         duration: Duration,
@@ -1103,9 +1185,10 @@ impl SessionTelemetry {
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
     ) {
+        let flat_tool_name = tool_name.to_string();
         let success_str = if success { "true" } else { "false" };
         let mut tags = Vec::with_capacity(2 + extra_tags.len());
-        tags.push(("tool", tool_name));
+        tags.push(("tool", flat_tool_name.as_str()));
         tags.push(("success", success_str));
         tags.extend_from_slice(extra_tags);
         self.counter(TOOL_CALL_COUNT_METRIC, /*inc*/ 1, &tags);
@@ -1113,30 +1196,19 @@ impl SessionTelemetry {
         let mcp_server = trace_field_value(extra_trace_fields, "mcp_server").unwrap_or("");
         let mcp_server_origin =
             trace_field_value(extra_trace_fields, "mcp_server_origin").unwrap_or("");
-        log_event!(
+        emit_tool_result(
             self,
-            event.name = "codex.tool_result",
-            tool_name = %tool_name,
-            call_id = %call_id,
-            arguments = %arguments,
-            duration_ms = %duration.as_millis(),
-            success = %success_str,
-            output = %output,
-            mcp_server = %mcp_server,
-            mcp_server_origin = %mcp_server_origin,
-        );
-        trace_event!(
-            self,
-            event.name = "codex.tool_result",
-            tool_name = %tool_name,
-            call_id = %call_id,
-            duration_ms = %duration.as_millis(),
-            success = %success_str,
-            arguments_length = arguments.len() as i64,
-            output_length = output.len() as i64,
-            output_line_count = output.lines().count() as i64,
-            tool_origin = if mcp_server.is_empty() { "builtin" } else { "mcp" },
-            mcp_tool = !mcp_server.is_empty(),
+            self.tool_result_log_config,
+            ToolResultEvent {
+                tool_name,
+                call_id,
+                arguments,
+                mcp_server,
+                mcp_server_origin,
+                duration,
+                success,
+                output,
+            },
         );
     }
 
@@ -1177,16 +1249,20 @@ impl SessionTelemetry {
 
         let engine_iapi_tbt_value =
             timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_IAPI_TBT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_iapi_tbt_value) {
-            self.record_duration(RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC, duration, &[]);
+        if let Some(duration_ms) = f64_ms_value(engine_iapi_tbt_value) {
+            self.record_duration_ms_f64(
+                RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC,
+                duration_ms,
+                &[],
+            );
         }
 
         let engine_service_tbt_value =
             timing_metrics.and_then(|value| value.get(RESPONSES_API_ENGINE_SERVICE_TBT_FIELD));
-        if let Some(duration) = duration_from_ms_value(engine_service_tbt_value) {
-            self.record_duration(
+        if let Some(duration_ms) = f64_ms_value(engine_service_tbt_value) {
+            self.record_duration_ms_f64(
                 RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC,
-                duration,
+                duration_ms,
                 &[],
             );
         }
@@ -1202,6 +1278,7 @@ impl SessionTelemetry {
             ResponseEvent::OutputTextDelta(_) => "text_delta".into(),
             ResponseEvent::ToolCallInputDelta { .. } => "tool_input_delta".into(),
             ResponseEvent::ReasoningSummaryDelta { .. } => "reasoning_summary_delta".into(),
+            ResponseEvent::ReasoningSummaryDone { .. } => "reasoning_summary_done".into(),
             ResponseEvent::ReasoningContentDelta { .. } => "reasoning_content_delta".into(),
             ResponseEvent::ReasoningSummaryPartAdded { .. } => {
                 "reasoning_summary_part_added".into()
@@ -1209,6 +1286,7 @@ impl SessionTelemetry {
             ResponseEvent::ServerModel(_) => "server_model".into(),
             ResponseEvent::ModelVerifications(_) => "model_verifications".into(),
             ResponseEvent::TurnModerationMetadata(_) => "turn_moderation_metadata".into(),
+            ResponseEvent::SafetyBuffering(_) => "safety_buffering".into(),
             ResponseEvent::ServerReasoningIncluded(_) => "server_reasoning_included".into(),
             ResponseEvent::RateLimits(_) => "rate_limits".into(),
             ResponseEvent::ModelsEtag(_) => "models_etag".into(),
@@ -1217,6 +1295,7 @@ impl SessionTelemetry {
 
     fn responses_item_type(item: &ResponseItem) -> String {
         match item {
+            ResponseItem::AdditionalTools { .. } => "additional_tools".into(),
             ResponseItem::Message { role, .. } => format!("message_from_{role}"),
             ResponseItem::AgentMessage { .. } => "agent_message".into(),
             ResponseItem::Reasoning { .. } => "reasoning".into(),
@@ -1238,6 +1317,11 @@ impl SessionTelemetry {
 }
 
 fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration> {
+    let ms = f64_ms_value(value)?;
+    Some(Duration::from_millis(ms.round() as u64))
+}
+
+fn f64_ms_value(value: Option<&serde_json::Value>) -> Option<f64> {
     let value = value?;
     let ms = value
         .as_f64()
@@ -1246,6 +1330,5 @@ fn duration_from_ms_value(value: Option<&serde_json::Value>) -> Option<Duration>
     if !ms.is_finite() || ms < 0.0 {
         return None;
     }
-    let clamped = ms.min(u64::MAX as f64);
-    Some(Duration::from_millis(clamped.round() as u64))
+    Some(ms.min(u64::MAX as f64))
 }
