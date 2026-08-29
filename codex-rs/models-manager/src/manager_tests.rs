@@ -202,6 +202,7 @@ impl TestModelsEndpoint {
             uses_custom_endpoint: false,
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
+            observed_proxy_policy: Mutex::new(None),
         })
     }
 
@@ -1382,7 +1383,7 @@ async fn refresh_available_models_fetches_and_replaces_bundled_models_for_custom
     );
 
     manager
-        .refresh_available_models(RefreshStrategy::Online)
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
         .await
         .expect("refresh should fetch with a custom endpoint");
 
@@ -1421,7 +1422,7 @@ async fn refresh_available_models_skips_network_for_api_key_without_custom_endpo
     );
 
     manager
-        .refresh_available_models(RefreshStrategy::Online)
+        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
         .await
         .expect("refresh should no-op with plain API key auth");
 

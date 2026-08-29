@@ -117,6 +117,7 @@ fn normalize_request_user_input_tool_args_sets_other_on_every_question() {
             question: "Proceed?".to_string(),
             is_other: false,
             is_secret: false,
+            is_multi_select: false,
             options: Some(vec![RequestUserInputQuestionOption {
                 label: "Yes (Recommended)".to_string(),
                 description: "Continue.".to_string(),
@@ -144,6 +145,7 @@ fn normalize_request_user_input_tool_args_rejects_missing_options() {
             question: "Proceed?".to_string(),
             is_other: false,
             is_secret: false,
+            is_multi_select: false,
             options: None,
         }],
     };

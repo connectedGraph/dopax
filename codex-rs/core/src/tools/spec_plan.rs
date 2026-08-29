@@ -27,8 +27,6 @@ use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
 use crate::tools::handlers::RequestUserMultiSelectHandler;
 use crate::tools::handlers::SendUserMessageAsyncHandler;
-use crate::tools::handlers::ShellCommandHandler;
-use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
@@ -1143,7 +1141,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
             },
             ToolExposure::DirectModelOnly,
         );
-        planned_tools.add_with_exposure(
+        registry.add_with_exposure(
             RequestUserMultiSelectHandler {
                 available_modes: request_user_input_available_modes(features),
             },

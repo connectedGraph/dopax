@@ -29,7 +29,10 @@ impl ToolExecutor<ToolInvocation> for RequestUserMultiSelectHandler {
         create_request_user_multi_select_tool(request_user_multi_select_tool_description(&self.available_modes))
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }

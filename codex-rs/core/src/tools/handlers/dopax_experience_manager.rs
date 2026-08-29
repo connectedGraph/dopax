@@ -37,7 +37,10 @@ impl ToolExecutor<ToolInvocation> for DopaxExperienceManagerHandler {
         create_dopax_experience_manager_tool()
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(async move {
             let ToolInvocation { payload, .. } = invocation;
             let ToolPayload::Function { arguments } = payload else {

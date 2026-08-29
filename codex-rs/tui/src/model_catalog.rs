@@ -120,6 +120,7 @@ fn custom_preset_to_model(preset: &CustomModelPreset) -> Option<ModelPreset> {
         model: model.clone(),
         display_name: model.clone(),
         description: preset.description.clone().unwrap_or_default(),
+        model_specialty: None,
         default_reasoning_effort: preset
             .default_reasoning_effort
             .clone()
@@ -132,6 +133,7 @@ fn custom_preset_to_model(preset: &CustomModelPreset) -> Option<ModelPreset> {
         is_default: false,
         upgrade: None,
         show_in_picker: preset.show_in_picker.unwrap_or(true),
+        multi_agent_version: None,
         availability_nux: None,
         supported_in_api: true,
         input_modalities: Vec::new(),
@@ -148,6 +150,7 @@ mod tests {
             model: model.to_string(),
             display_name: model.to_string(),
             description: "base".to_string(),
+            model_specialty: None,
             default_reasoning_effort: ReasoningEffort::Medium,
             supported_reasoning_efforts: vec![ReasoningEffortPreset {
                 effort: ReasoningEffort::Medium,
@@ -160,6 +163,7 @@ mod tests {
             is_default: false,
             upgrade: None,
             show_in_picker: true,
+            multi_agent_version: None,
             availability_nux: None,
             supported_in_api: true,
             input_modalities: Vec::new(),

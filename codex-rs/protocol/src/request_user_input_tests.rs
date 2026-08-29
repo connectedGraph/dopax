@@ -32,6 +32,7 @@ fn request_user_input_event_defaults_legacy_missing_is_blocking_to_true() {
                 question: "Continue?".to_string(),
                 is_other: false,
                 is_secret: false,
+                is_multi_select: false,
                 options: Some(vec![RequestUserInputQuestionOption {
                     label: "Yes".to_string(),
                     description: "Continue.".to_string(),
