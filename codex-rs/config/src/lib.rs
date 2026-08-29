@@ -3,6 +3,8 @@ mod cloud_config_layers;
 mod config_layer_source;
 mod config_requirements;
 pub mod config_toml;
+pub use config_toml::ConfigToml;
+pub use config_toml::CustomModelPreset;
 mod constraint;
 mod diagnostics;
 mod fingerprint;

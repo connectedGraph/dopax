@@ -24,6 +24,10 @@ pub struct RequestUserInputQuestion {
     #[schemars(rename = "isSecret")]
     #[ts(rename = "isSecret")]
     pub is_secret: bool,
+    #[serde(rename = "isMultiSelect", default)]
+    #[schemars(rename = "isMultiSelect")]
+    #[ts(rename = "isMultiSelect")]
+    pub is_multi_select: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<RequestUserInputQuestionOption>>,
 }

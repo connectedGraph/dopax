@@ -9,6 +9,7 @@ use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::Method;
 use http::header::ETAG;
+use serde::Deserialize;
 use std::sync::Arc;
 
 pub struct ModelsClient<T: HttpTransport> {
@@ -61,16 +62,66 @@ impl<T: HttpTransport> ModelsClient<T> {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        let ModelsResponse { models } = serde_json::from_slice::<ModelsResponse>(&resp.body)
-            .map_err(|e| {
-                ApiError::Stream(format!(
-                    "failed to decode models response: {e}; body: {}",
-                    String::from_utf8_lossy(&resp.body)
-                ))
-            })?;
+        let models = parse_models_response(&resp.body).map_err(|e| {
+            ApiError::Stream(format!(
+                "failed to decode models response: {e}; body: {}",
+                String::from_utf8_lossy(&resp.body)
+            ))
+        })?;
 
         Ok((models, header_etag))
     }
+}
+
+/// Parse a `/models` response body.
+///
+/// The Codex backend returns `{"models": [...]}` with full metadata. OpenAI-compatible
+/// relay providers may return `{"models": [...]}` but only containing slugs, or the
+/// standard `{"object": "list", "data": [{"id": ...}]}` shape.
+/// We map these loose shapes to minimal model metadata so their catalog can drive the
+/// picker. When all shapes fail to parse, the original deserialization error is returned.
+fn parse_models_response(body: &[u8]) -> Result<Vec<ModelInfo>, serde_json::Error> {
+    // 1. Try strict Codex backend format
+    let codex_error = match serde_json::from_slice::<ModelsResponse>(body) {
+        Ok(response) => return Ok(response.models),
+        Err(err) => err,
+    };
+
+    // 2. Try loose Codex relay format (has "models" but may lack display_name etc.)
+    #[derive(Deserialize)]
+    struct LooseModelsResponse {
+        models: Vec<LooseModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct LooseModelEntry {
+        slug: String,
+    }
+    if let Ok(loose) = serde_json::from_slice::<LooseModelsResponse>(body) {
+        return Ok(loose
+            .models
+            .into_iter()
+            .map(|entry| ModelInfo::from_openai_list_slug(entry.slug))
+            .collect());
+    }
+
+    // 3. Try standard OpenAI compatible list format (has "data")
+    let list: OpenAiModelsList = serde_json::from_slice(body).map_err(|_| codex_error)?;
+    Ok(list
+        .data
+        .into_iter()
+        .map(|entry| ModelInfo::from_openai_list_slug(entry.id))
+        .collect())
+}
+
+/// Standard OpenAI-compatible `/models` list response.
+#[derive(Deserialize)]
+struct OpenAiModelsList {
+    data: Vec<OpenAiModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiModelEntry {
+    id: String,
 }
 
 #[cfg(test)]
@@ -93,7 +144,7 @@ mod tests {
     #[derive(Clone)]
     struct CapturingTransport {
         last_request: Arc<Mutex<Option<Request>>>,
-        body: Arc<ModelsResponse>,
+        body: Arc<Vec<u8>>,
         etag: Option<String>,
     }
 
@@ -101,7 +152,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 last_request: Arc::new(Mutex::new(None)),
-                body: Arc::new(ModelsResponse { models: Vec::new() }),
+                body: Arc::new(b"{\"models\":[]}".to_vec()),
                 etag: None,
             }
         }
@@ -110,15 +161,17 @@ mod tests {
     impl HttpTransport for CapturingTransport {
         async fn execute(&self, req: Request) -> Result<Response, TransportError> {
             *self.last_request.lock().unwrap() = Some(req);
-            let body = serde_json::to_vec(&*self.body).unwrap();
-            let mut headers = HeaderMap::new();
-            if let Some(etag) = &self.etag {
+            let headers = if let Some(etag) = &self.etag {
+                let mut headers = HeaderMap::new();
                 headers.insert(ETAG, etag.parse().unwrap());
-            }
+                headers
+            } else {
+                HeaderMap::new()
+            };
             Ok(Response {
                 status: StatusCode::OK,
                 headers,
-                body: body.into(),
+                body: (*self.body).clone().into(),
             })
         }
 
@@ -153,11 +206,9 @@ mod tests {
 
     #[tokio::test]
     async fn appends_client_version_query() {
-        let response = ModelsResponse { models: Vec::new() };
-
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(b"{\"models\":[]}".to_vec()),
             etag: None,
         };
 
@@ -221,7 +272,7 @@ mod tests {
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).unwrap()),
             etag: None,
         };
 
@@ -243,12 +294,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_models_includes_etag() {
-        let response = ModelsResponse { models: Vec::new() };
+    async fn parses_openai_standard_models_response() {
+        use codex_protocol::openai_models::ModelVisibility;
+
+        let response = json!({
+            "object": "list",
+            "data": [
+                {"id": "deepseek-chat", "object": "model", "created": 1_734_000_000, "owned_by": "deepseek"},
+                {"id": "gpt-oss-120b", "object": "model", "created": 1_734_000_000, "owned_by": "openai"}
+            ]
+        });
 
         let transport = CapturingTransport {
             last_request: Arc::new(Mutex::new(None)),
-            body: Arc::new(response),
+            body: Arc::new(serde_json::to_vec(&response).unwrap()),
+            etag: None,
+        };
+
+        let client = ModelsClient::new(
+            transport,
+            provider("https://example.com/api/codex"),
+            Arc::new(DummyAuth),
+        );
+
+        let (models, _) = client
+            .list_models("0.99.0", HeaderMap::new())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].slug, "deepseek-chat");
+        assert_eq!(models[0].display_name, "deepseek-chat");
+        assert!(models[0].supported_in_api);
+        assert!(models[0].visibility == ModelVisibility::List);
+        assert_eq!(models[1].slug, "gpt-oss-120b");
+    }
+
+    #[tokio::test]
+    async fn list_models_includes_etag() {
+        let transport = CapturingTransport {
+            last_request: Arc::new(Mutex::new(None)),
+            body: Arc::new(b"{\"models\":[]}".to_vec()),
             etag: Some("\"abc\"".to_string()),
         };
 

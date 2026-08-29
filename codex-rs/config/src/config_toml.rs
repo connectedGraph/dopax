@@ -381,6 +381,10 @@ pub struct ConfigToml {
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
 
+    /// Custom model presets catalogs locally configured.
+    #[serde(default)]
+    pub model_catalog: Option<Vec<CustomModelPreset>>,
+
     /// Machine-local realtime audio device preferences used by realtime voice.
     #[serde(default)]
     pub audio: Option<RealtimeAudioToml>,
@@ -965,6 +969,23 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
             ),
         )),
     }
+}
+
+/// Custom model preset metadata configuration.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+pub struct CustomModelPreset {
+    pub model: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub context_window: Option<i64>,
+    #[serde(default)]
+    pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub supports_fast_mode: Option<bool>,
+    #[serde(default)]
+    pub show_in_picker: Option<bool>,
 }
 
 #[cfg(test)]

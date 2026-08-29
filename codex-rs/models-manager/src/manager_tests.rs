@@ -75,6 +75,7 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
 struct TestModelsEndpoint {
     has_command_auth: bool,
     uses_codex_backend: bool,
+    uses_custom_endpoint: bool,
     responses: Mutex<VecDeque<Vec<ModelInfo>>>,
     fetch_count: AtomicUsize,
 }
@@ -84,6 +85,7 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: true,
+            uses_custom_endpoint: false,
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
         })
@@ -93,6 +95,17 @@ impl TestModelsEndpoint {
         Arc::new(Self {
             has_command_auth: false,
             uses_codex_backend: false,
+            uses_custom_endpoint: false,
+            responses: Mutex::new(responses.into()),
+            fetch_count: AtomicUsize::new(0),
+        })
+    }
+
+    fn custom_endpoint(responses: Vec<Vec<ModelInfo>>) -> Arc<Self> {
+        Arc::new(Self {
+            has_command_auth: false,
+            uses_codex_backend: false,
+            uses_custom_endpoint: true,
             responses: Mutex::new(responses.into()),
             fetch_count: AtomicUsize::new(0),
         })
@@ -161,6 +174,10 @@ impl ExternalAuth for TestUnresolvedExternalApiKeyAuth {
 impl ModelsEndpointClient for TestModelsEndpoint {
     fn has_command_auth(&self) -> bool {
         self.has_command_auth
+    }
+
+    fn uses_custom_endpoint(&self) -> bool {
+        self.uses_custom_endpoint
     }
 
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
@@ -507,6 +524,7 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     let endpoint = Arc::new(TestModelsEndpoint {
         has_command_auth: true,
         uses_codex_backend: false,
+        uses_custom_endpoint: false,
         responses: Mutex::new(vec![remote_models.clone()].into()),
         fetch_count: AtomicUsize::new(0),
     });
@@ -749,6 +767,10 @@ impl ModelsEndpointClient for TestAuthAwareModelsEndpoint {
         false
     }
 
+    fn uses_custom_endpoint(&self) -> bool {
+        false
+    }
+
     fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
         Box::pin(TestAuthAwareModelsEndpoint::uses_codex_backend(self))
     }
@@ -798,6 +820,75 @@ async fn refresh_available_models_skips_network_when_external_api_key_overrides_
         endpoint.fetch_count(),
         0,
         "endpoint should avoid model fetches when external API key auth is active"
+    );
+}
+
+#[tokio::test]
+async fn refresh_available_models_fetches_and_replaces_bundled_models_for_custom_endpoint() {
+    let dynamic_slug = "dynamic-model-only-for-test-custom-endpoint";
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    auth_manager.set_external_auth(Arc::new(TestExternalApiKeyAuth));
+    let endpoint = TestModelsEndpoint::custom_endpoint(vec![vec![remote_model(
+        dynamic_slug,
+        "Custom Endpoint",
+        /*priority*/ 1,
+    )]]);
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(auth_manager),
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online)
+        .await
+        .expect("refresh should fetch with a custom endpoint");
+
+    let remote_models = manager.get_remote_models().await;
+    assert!(
+        remote_models.iter().any(|candidate| candidate.slug == dynamic_slug),
+        "remote refresh should include models fetched from a custom endpoint"
+    );
+    assert!(
+        !remote_models.iter().any(|candidate| candidate.slug == "gpt-5.5"),
+        "bundled models should be replaced by the custom endpoint catalog"
+    );
+    assert_eq!(
+        endpoint.fetch_count(),
+        1,
+        "endpoint should fetch models for a custom endpoint even with API key auth"
+    );
+}
+
+#[tokio::test]
+async fn refresh_available_models_skips_network_for_api_key_without_custom_endpoint() {
+    let dynamic_slug = "dynamic-model-only-for-test-plain-api-key";
+    let codex_home = tempdir().expect("temp dir");
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    auth_manager.set_external_auth(Arc::new(TestExternalApiKeyAuth));
+    let endpoint = TestModelsEndpoint::without_refresh(vec![vec![remote_model(
+        dynamic_slug,
+        "Plain API Key",
+        /*priority*/ 1,
+    )]]);
+    let manager = openai_manager_for_tests_with_auth(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        Some(auth_manager),
+    );
+
+    manager
+        .refresh_available_models(RefreshStrategy::Online)
+        .await
+        .expect("refresh should no-op with plain API key auth");
+
+    assert_eq!(
+        endpoint.fetch_count(),
+        0,
+        "endpoint should avoid model fetches for a plain API key without a custom endpoint"
     );
 }
 

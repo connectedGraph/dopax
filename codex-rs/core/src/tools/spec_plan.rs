@@ -8,6 +8,7 @@ use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
 use crate::tools::handlers::CurrentTimeHandler;
+use crate::tools::handlers::DopaxExperienceManagerHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
@@ -22,6 +23,7 @@ use crate::tools::handlers::ReadMcpResourceHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
+use crate::tools::handlers::RequestUserMultiSelectHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
@@ -701,6 +703,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
             },
             ToolExposure::DirectModelOnly,
         );
+        planned_tools.add_with_exposure(
+            RequestUserMultiSelectHandler {
+                available_modes: request_user_input_available_modes(features),
+            },
+            ToolExposure::DirectModelOnly,
+        );
     }
 
     if features.enabled(Feature::RequestPermissionsTool) {
@@ -715,6 +723,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     if features.enabled(Feature::CurrentTimeReminder) {
         planned_tools.add(CurrentTimeHandler);
     }
+    planned_tools.add(DopaxExperienceManagerHandler);
 
     if features.enabled(Feature::SleepTool) {
         planned_tools.add(SleepHandler);

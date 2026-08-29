@@ -45,31 +45,32 @@ then return all-empty fields exactly:
 `{"rollout_summary":"","rollout_slug":"","raw_memory":""}`
 
 ============================================================
-WHAT COUNTS AS HIGH-SIGNAL MEMORY
+WHAT COUNTS AS HIGH-SIGNAL MEMORY (DOPAX PERSONALITY & GROWTH FOCUS)
 ============================================================
 
-Use judgment. High-signal memory is not just "anything useful." It is information that
-should change the next agent's default behavior in a durable way.
+Use judgment. High-signal memory is information that deeply understands the user as an individual, tracks their personal/technical growth, and grounds key events in time.
 
-The highest-value memories usually fall into one of these buckets:
+The highest-value memories fall into these primary buckets:
 
-1. Stable user operating preferences
-   - what the user repeatedly asks for, corrects, or interrupts to enforce
-   - what they want by default without having to restate it
-2. High-leverage procedural knowledge
-   - hard-won shortcuts, failure shields, exact paths/commands, or repo facts that save
-     substantial future exploration time
-3. Reliable task maps and decision triggers
-   - where the truth lives, how to tell when a path is wrong, and what signal should cause
-     a pivot
-4. Durable evidence about the user's environment and workflow
-   - stable tooling habits, repo conventions, presentation/verification expectations
+1. User Personality, Communication Style & Core Preferences (人格与沟通风格)
+   - Unique expression habits, tone preferences, emotional patterns, and underlying values.
+   - Distinctive likes, dislikes, and expectations for Dopax's personality and interaction style.
+   - What the user repeatedly asks for, corrects, or enforces by default.
+
+2. Growth, Breakthroughs & Learning Progress (自我成长与能力进步)
+   - Conceptual breakthroughs: key ideas, math/logic insights, or architectural patterns the user mastered.
+   - Obstacles overcome: major cognitive bottlenecks or technical challenges conquered during interaction.
+   - Progress markers: noticeable improvements in methodology, clarity of thought, or project scope.
+
+3. Significant Events & Time-Ranged Timeline (事件与时间线)
+   - Key milestones achieved, completed modules, or major decisions made during the conversation.
+   - Time-range anchors: exact date/time windows (e.g. [YYYY-MM-DD ~ YYYY-MM-DD]) when events occurred.
+   - Contextual event history that enables the assistant to answer questions about recent user progress.
 
 Core principle:
 
-- Optimize for future user time saved, not just future agent time saved.
-- A strong memory often prevents future user keystrokes: less re-specification, fewer
-  corrections, fewer interruptions, fewer "don't do that yet" messages.
+- Optimize for long-term understanding, empathy, and growth tracking over purely code-procedural recaps.
+- A strong memory captures who the user is, what they accomplished, and when key events took place.
 
 Non-goals:
 

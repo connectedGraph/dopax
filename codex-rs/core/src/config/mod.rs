@@ -947,6 +947,9 @@ pub struct Config {
     /// When set, this replaces the bundled catalog for the current process.
     pub model_catalog: Option<ModelsResponse>,
 
+    /// Custom model catalog entries loaded from config.toml.
+    pub custom_model_catalog: Vec<codex_config::CustomModelPreset>,
+
     /// Optional verbosity control for GPT-5 models (Responses API `text.verbosity`).
     pub model_verbosity: Option<Verbosity>,
 
@@ -3788,6 +3791,7 @@ impl Config {
             model_reasoning_summary: cfg.model_reasoning_summary,
             model_supports_reasoning_summaries: cfg.model_supports_reasoning_summaries,
             model_catalog,
+            custom_model_catalog: cfg.model_catalog.clone().unwrap_or_default(),
             model_verbosity: cfg.model_verbosity,
             chatgpt_base_url: cfg
                 .chatgpt_base_url

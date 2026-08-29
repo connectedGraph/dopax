@@ -906,6 +906,37 @@ impl ConfigEditsBuilder {
         self
     }
 
+    /// Registers a custom OpenAI-compatible model provider with the given base
+    /// URL and selects it as the active provider. The API key is persisted as
+    /// `experimental_bearer_token` on the provider entry.
+    pub fn set_custom_model_provider(
+        mut self,
+        provider_id: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> Self {
+        for (key, entry) in [
+            ("name", provider_id),
+            ("base_url", base_url),
+            ("wire_api", "responses"),
+            ("experimental_bearer_token", api_key),
+        ] {
+            self.edits.push(ConfigEdit::SetPath {
+                segments: vec![
+                    "model_providers".to_string(),
+                    provider_id.to_string(),
+                    key.to_string(),
+                ],
+                value: value(entry.to_string()),
+            });
+        }
+        self.edits.push(ConfigEdit::SetPath {
+            segments: vec!["model_provider".to_string()],
+            value: value(provider_id.to_string()),
+        });
+        self
+    }
+
     pub fn set_realtime_microphone(mut self, microphone: Option<&str>) -> Self {
         let segments = vec!["audio".to_string(), "microphone".to_string()];
         match microphone {

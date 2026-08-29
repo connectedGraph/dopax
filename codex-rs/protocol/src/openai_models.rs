@@ -426,6 +426,54 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    /// Build a minimal descriptor for a model id reported by an
+    /// OpenAI-compatible `/models` endpoint, which only returns ids.
+    ///
+    /// The entry is picker-visible and API-supported; the remaining metadata
+    /// uses neutral defaults until the user supplies overrides via config.
+    pub fn from_openai_list_slug(slug: String) -> Self {
+        Self {
+            slug: slug.clone(),
+            display_name: slug,
+            description: None,
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
+            shell_type: ConfigShellToolType::Default,
+            visibility: ModelVisibility::List,
+            supported_in_api: true,
+            priority: 0,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            availability_nux: None,
+            upgrade: None,
+            base_instructions: String::new(),
+            model_messages: None,
+            supports_reasoning_summaries: false,
+            default_reasoning_summary: ReasoningSummary::Auto,
+            support_verbosity: false,
+            default_verbosity: None,
+            apply_patch_tool_type: None,
+            web_search_tool_type: WebSearchToolType::Text,
+            truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
+            supports_parallel_tool_calls: false,
+            supports_image_detail_original: false,
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
+            comp_hash: None,
+            effective_context_window_percent: default_effective_context_window_percent(),
+            experimental_supported_tools: Vec::new(),
+            input_modalities: default_input_modalities(),
+            used_fallback_model_metadata: true,
+            supports_search_tool: false,
+            use_responses_lite: false,
+            auto_review_model_override: None,
+            tool_mode: None,
+            multi_agent_version: None,
+        }
+    }
+
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
     }

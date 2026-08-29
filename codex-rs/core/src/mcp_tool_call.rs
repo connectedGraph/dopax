@@ -1635,6 +1635,7 @@ fn build_mcp_tool_approval_question(
         question,
         is_other: false,
         is_secret: false,
+        is_multi_select: false,
         options: Some(options),
     }
 }

@@ -40,6 +40,7 @@ const API_KEY_LOGIN_DISABLED_MESSAGE: &str =
 const ACCESS_TOKEN_LOGIN_DISABLED_MESSAGE: &str =
     "Access token login is disabled. Use API key login instead.";
 const LOGIN_SUCCESS_MESSAGE: &str = "Successfully logged in";
+const CUSTOM_PROVIDER_ID: &str = "dopax-custom";
 
 /// Installs a small file-backed tracing layer for direct `codex login` flows.
 ///
@@ -197,9 +198,16 @@ pub async fn run_login_with_api_key(
     let _login_log_guard = init_login_file_logging(&config);
     tracing::info!("starting api key login flow");
 
-    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Chatgpt)) {
+    if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
         eprintln!("{API_KEY_LOGIN_DISABLED_MESSAGE}");
         std::process::exit(1);
+    }
+
+    if let Some(custom_base_url) = prompt_custom_base_url() {
+        write_custom_provider_config(&config, &custom_base_url, &api_key).await;
+        eprintln!(
+            "Configured custom provider `dopax-custom` with base URL {custom_base_url} in config.toml."
+        );
     }
 
     match login_with_api_key(
@@ -216,6 +224,76 @@ pub async fn run_login_with_api_key(
             eprintln!("Error logging in: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Prompts the user to choose between the official OpenAI endpoint and a
+/// custom OpenAI-compatible base URL. Returns `None` when the user picks the
+/// official provider or declines to configure a custom one.
+fn prompt_custom_base_url() -> Option<String> {
+    use std::io::Write;
+
+    eprintln!("Select API provider:");
+    eprintln!("  1. OpenAI official (default)");
+    eprintln!("  2. Custom OpenAI Responses endpoint (relay / proxy / local server)");
+
+    let mut choice = String::new();
+    eprint!("Choice [1]: ");
+    std::io::stderr()
+        .flush()
+        .expect("stderr flush should not fail");
+    if std::io::stdin()
+        .read_line(&mut choice)
+        .is_err()
+    {
+        return None;
+    }
+
+    let choice = choice.trim();
+    if choice.is_empty() || choice == "1" {
+        return None;
+    }
+    if choice != "2" {
+        eprintln!("Invalid choice `{choice}`; using OpenAI official.");
+        return None;
+    }
+
+    eprintln!("Custom provider selected.");
+    eprintln!(
+        "Enter the base URL (e.g. https://my-relay.example.com/v1). The URL is validated but not probed."
+    );
+    let mut base_url = String::new();
+    eprint!("Base URL: ");
+    std::io::stderr()
+        .flush()
+        .expect("stderr flush should not fail");
+    if std::io::stdin()
+        .read_line(&mut base_url)
+        .is_err()
+    {
+        return None;
+    }
+
+    let base_url = base_url.trim().to_string();
+    if base_url.is_empty() {
+        eprintln!("Empty base URL; using OpenAI official.");
+        return None;
+    }
+    if url::Url::parse(&base_url).is_err() {
+        eprintln!("Invalid base URL `{base_url}`; using OpenAI official.");
+        return None;
+    }
+
+    Some(base_url)
+}
+
+async fn write_custom_provider_config(config: &Config, base_url: &str, api_key: &str) {
+    if let Err(err) = codex_core::config::edit::ConfigEditsBuilder::for_config(config)
+        .set_custom_model_provider(CUSTOM_PROVIDER_ID, base_url, api_key)
+        .apply()
+        .await
+    {
+        tracing::warn!("failed to write custom provider config: {err}");
     }
 }
 
