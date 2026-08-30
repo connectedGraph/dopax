@@ -1136,6 +1136,49 @@
       ],
       "type": "string"
     },
+    "CustomModelPreset": {
+      "description": "Custom model preset metadata configuration.",
+      "properties": {
+        "context_window": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "default_reasoning_effort": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ReasoningEffort"
+            }
+          ],
+          "default": null
+        },
+        "description": {
+          "default": null,
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "reasoning_efforts": {
+          "default": null,
+          "items": {
+            "$ref": "#/definitions/ReasoningEffort"
+          },
+          "type": "array"
+        },
+        "show_in_picker": {
+          "default": null,
+          "type": "boolean"
+        },
+        "supports_fast_mode": {
+          "default": null,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
     "ExperimentalRequestUserInput": {
       "additionalProperties": false,
       "properties": {
@@ -6322,6 +6365,14 @@
         }
       ],
       "description": "Controls whether the auto-compaction limit applies to the full context or only to tokens after the carried prefix in the current compaction window."
+    },
+    "model_catalog": {
+      "default": null,
+      "description": "Custom model presets catalogs locally configured.",
+      "items": {
+        "$ref": "#/definitions/CustomModelPreset"
+      },
+      "type": "array"
     },
     "model_catalog_json": {
       "allOf": [
