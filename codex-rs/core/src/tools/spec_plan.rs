@@ -1178,8 +1178,8 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
         {
             registry.add(SleepHandler);
         }
+        registry.add(DopaxExperienceManagerHandler);
     }
-    registry.add(DopaxExperienceManagerHandler);
 
     if tool_suggest_enabled(turn_context)
         && let Some(candidates) = context
