@@ -67,10 +67,16 @@ impl ToolExecutor<ToolInvocation> for DopaxExperienceManagerHandler {
                     });
                     let item = ExperienceItem {
                         id: id.clone(),
-                        title: args.title.unwrap_or_else(|| "Untitled Experience".to_string()),
+                        title: args
+                            .title
+                            .unwrap_or_else(|| "Untitled Experience".to_string()),
                         status: args.status.unwrap_or_else(|| "ongoing".to_string()),
-                        start_date: args.start_date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string()),
-                        end_date: args.end_date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string()),
+                        start_date: args
+                            .start_date
+                            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string()),
+                        end_date: args
+                            .end_date
+                            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string()),
                         summary: args.summary.unwrap_or_default(),
                         tags: args.tags.unwrap_or_default(),
                     };

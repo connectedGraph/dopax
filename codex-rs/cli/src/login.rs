@@ -257,10 +257,7 @@ fn prompt_custom_base_url() -> Option<String> {
     std::io::stderr()
         .flush()
         .expect("stderr flush should not fail");
-    if std::io::stdin()
-        .read_line(&mut choice)
-        .is_err()
-    {
+    if std::io::stdin().read_line(&mut choice).is_err() {
         return None;
     }
 
@@ -282,10 +279,7 @@ fn prompt_custom_base_url() -> Option<String> {
     std::io::stderr()
         .flush()
         .expect("stderr flush should not fail");
-    if std::io::stdin()
-        .read_line(&mut base_url)
-        .is_err()
-    {
+    if std::io::stdin().read_line(&mut base_url).is_err() {
         return None;
     }
 

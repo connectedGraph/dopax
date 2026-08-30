@@ -17,13 +17,17 @@ pub fn create_dopax_experience_manager_tool() -> ToolSpec {
                     json!("delete"),
                     json!("list"),
                 ],
-                Some("Action to perform on user experience events: create, update, delete, or list.".to_string()),
+                Some(
+                    "Action to perform on user experience events: create, update, delete, or list."
+                        .to_string(),
+                ),
             ),
         ),
         (
             "id".to_string(),
             JsonSchema::string(Some(
-                "Unique event identifier (required for update/delete, e.g. exp_20260802_01).".to_string(),
+                "Unique event identifier (required for update/delete, e.g. exp_20260802_01)."
+                    .to_string(),
             )),
         ),
         (
@@ -36,14 +40,14 @@ pub fn create_dopax_experience_manager_tool() -> ToolSpec {
             "status".to_string(),
             JsonSchema::string_enum(
                 vec![json!("ongoing"), json!("completed"), json!("expired")],
-                Some("Current status of the experience: ongoing, completed, or expired.".to_string()),
+                Some(
+                    "Current status of the experience: ongoing, completed, or expired.".to_string(),
+                ),
             ),
         ),
         (
             "start_date".to_string(),
-            JsonSchema::string(Some(
-                "Start date in YYYY-MM-DD format.".to_string(),
-            )),
+            JsonSchema::string(Some("Start date in YYYY-MM-DD format.".to_string())),
         ),
         (
             "end_date".to_string(),

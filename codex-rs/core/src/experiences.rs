@@ -10,7 +10,7 @@ use tracing::warn;
 pub struct ExperienceItem {
     pub id: String,
     pub title: String,
-    pub status: String, // "ongoing" | "completed" | "expired"
+    pub status: String,     // "ongoing" | "completed" | "expired"
     pub start_date: String, // "YYYY-MM-DD"
     pub end_date: String,   // "YYYY-MM-DD"
     pub summary: String,

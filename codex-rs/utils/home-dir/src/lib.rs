@@ -29,7 +29,9 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
             let metadata = std::fs::metadata(&path).map_err(|err| match err.kind() {
                 std::io::ErrorKind::NotFound => std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    format!("DOPAX_HOME/CODEX_HOME points to {val:?}, but that path does not exist"),
+                    format!(
+                        "DOPAX_HOME/CODEX_HOME points to {val:?}, but that path does not exist"
+                    ),
                 ),
                 _ => std::io::Error::new(
                     err.kind(),
@@ -40,7 +42,9 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
             if !metadata.is_dir() {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!("DOPAX_HOME/CODEX_HOME points to {val:?}, but that path is not a directory"),
+                    format!(
+                        "DOPAX_HOME/CODEX_HOME points to {val:?}, but that path is not a directory"
+                    ),
                 ))
             } else {
                 let canonical = path.canonicalize().map_err(|err| {

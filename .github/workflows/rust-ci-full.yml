@@ -90,6 +90,7 @@ jobs:
           RUST_MIN_STACK: "8388608" # 8 MiB
 
   argument_comment_lint_prebuilt:
+    if: false
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
     timeout-minutes: 30

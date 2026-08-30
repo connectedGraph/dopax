@@ -64,7 +64,11 @@ fn apply_custom_preset(model: &mut ModelPreset, preset: &CustomModelPreset) {
     }
     if let Some(supports_fast_mode) = preset.supports_fast_mode {
         model.additional_speed_tiers = if supports_fast_mode {
-            if !model.additional_speed_tiers.iter().any(|tier| tier == SPEED_TIER_FAST) {
+            if !model
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier == SPEED_TIER_FAST)
+            {
                 vec![SPEED_TIER_FAST.to_string()]
             } else {
                 model.additional_speed_tiers.clone()
@@ -121,10 +125,7 @@ fn custom_preset_to_model(preset: &CustomModelPreset) -> Option<ModelPreset> {
         display_name: model.clone(),
         description: preset.description.clone().unwrap_or_default(),
         model_specialty: None,
-        default_reasoning_effort: preset
-            .default_reasoning_effort
-            .clone()
-            .unwrap_or_default(),
+        default_reasoning_effort: preset.default_reasoning_effort.clone().unwrap_or_default(),
         supported_reasoning_efforts,
         supports_personality: false,
         additional_speed_tiers,
@@ -183,7 +184,9 @@ mod tests {
             show_in_picker: None,
         }]);
 
-        let models = catalog.try_list_models().expect("catalog should list models");
+        let models = catalog
+            .try_list_models()
+            .expect("catalog should list models");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].description, "custom description");
         assert!(models[0].supports_fast_mode());
@@ -202,7 +205,9 @@ mod tests {
             show_in_picker: Some(true),
         }]);
 
-        let models = catalog.try_list_models().expect("catalog should list models");
+        let models = catalog
+            .try_list_models()
+            .expect("catalog should list models");
         assert_eq!(models.len(), 2);
         let custom = models
             .iter()
@@ -218,7 +223,9 @@ mod tests {
     fn merge_custom_presets_noop_on_empty() {
         let mut catalog = ModelCatalog::new(vec![base_preset("gpt-x")]);
         catalog.merge_custom_presets(Vec::new());
-        let models = catalog.try_list_models().expect("catalog should list models");
+        let models = catalog
+            .try_list_models()
+            .expect("catalog should list models");
         assert_eq!(models.len(), 1);
     }
 }

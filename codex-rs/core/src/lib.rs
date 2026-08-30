@@ -56,7 +56,6 @@ mod command_canonicalization;
 pub mod config;
 pub mod connectors;
 pub mod context;
-pub mod experiences;
 mod context_manager;
 mod current_time;
 mod cyber_access_program;
@@ -65,6 +64,7 @@ mod environment_selection;
 pub mod exec;
 pub mod exec_env;
 mod exec_policy;
+pub mod experiences;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;

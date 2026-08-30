@@ -1389,11 +1389,15 @@ async fn refresh_available_models_fetches_and_replaces_bundled_models_for_custom
 
     let remote_models = manager.get_remote_models().await;
     assert!(
-        remote_models.iter().any(|candidate| candidate.slug == dynamic_slug),
+        remote_models
+            .iter()
+            .any(|candidate| candidate.slug == dynamic_slug),
         "remote refresh should include models fetched from a custom endpoint"
     );
     assert!(
-        !remote_models.iter().any(|candidate| candidate.slug == "gpt-5.5"),
+        !remote_models
+            .iter()
+            .any(|candidate| candidate.slug == "gpt-5.5"),
         "bundled models should be replaced by the custom endpoint catalog"
     );
     assert_eq!(

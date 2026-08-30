@@ -99,7 +99,9 @@ pub fn normalize_request_user_multi_select_args(
         .iter()
         .any(|question| question.options.as_ref().is_none_or(Vec::is_empty));
     if missing_options {
-        return Err("request_user_multi_select requires non-empty options for every question".to_string());
+        return Err(
+            "request_user_multi_select requires non-empty options for every question".to_string(),
+        );
     }
 
     for question in &mut args.questions {

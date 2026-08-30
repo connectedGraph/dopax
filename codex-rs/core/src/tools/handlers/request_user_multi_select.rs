@@ -4,11 +4,11 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
 use crate::tools::handlers::request_user_multi_select_spec::REQUEST_USER_MULTI_SELECT_TOOL_NAME;
 use crate::tools::handlers::request_user_multi_select_spec::create_request_user_multi_select_tool;
 use crate::tools::handlers::request_user_multi_select_spec::normalize_request_user_multi_select_args;
 use crate::tools::handlers::request_user_multi_select_spec::request_user_multi_select_tool_description;
-use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::config_types::ModeKind;
@@ -26,7 +26,9 @@ impl ToolExecutor<ToolInvocation> for RequestUserMultiSelectHandler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_request_user_multi_select_tool(request_user_multi_select_tool_description(&self.available_modes))
+        create_request_user_multi_select_tool(request_user_multi_select_tool_description(
+            &self.available_modes,
+        ))
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -71,8 +73,8 @@ impl RequestUserMultiSelectHandler {
         }
 
         let args: RequestUserInputArgs = parse_arguments(&arguments)?;
-        let args =
-            normalize_request_user_multi_select_args(args).map_err(FunctionCallError::RespondToModel)?;
+        let args = normalize_request_user_multi_select_args(args)
+            .map_err(FunctionCallError::RespondToModel)?;
         let response = session
             .request_user_input(turn.as_ref(), call_id, args)
             .await
