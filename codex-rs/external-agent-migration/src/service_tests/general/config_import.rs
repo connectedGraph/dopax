@@ -638,10 +638,7 @@ async fn codex_real_home_detect_finds_config_and_skills() {
         })
         .await
         .expect("detect");
-    let types: Vec<_> = items
-        .iter()
-        .map(|item| item.item_type)
-        .collect();
+    let types: Vec<_> = items.iter().map(|item| item.item_type).collect();
     println!("detected items: {types:?}");
     assert!(
         types.contains(&ExternalAgentConfigMigrationItemType::Config),

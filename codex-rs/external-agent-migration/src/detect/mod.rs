@@ -444,7 +444,7 @@ impl ExternalAgentConfigService {
             Err(err) => {
                 return Err(invalid_data_error(format!(
                     "invalid source config.toml: {err}"
-                )))
+                )));
             }
         };
         if is_empty_toml_table(&migrated) {

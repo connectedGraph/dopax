@@ -56,7 +56,8 @@ fn repo_instruction_source_groups_prefers_repo_root_agents_md() {
     let codex_dir = root.path().join(".codex");
     fs::create_dir_all(&codex_dir).expect("create .codex");
     fs::write(root.path().join("AGENTS.md"), "# repo instructions").expect("write repo AGENTS.md");
-    fs::write(codex_dir.join("AGENTS.md"), "# project instructions").expect("write .codex AGENTS.md");
+    fs::write(codex_dir.join("AGENTS.md"), "# project instructions")
+        .expect("write .codex AGENTS.md");
     assert_eq!(
         CodexSource::repo_instruction_source_groups(root.path()).expect("groups"),
         vec![InstructionSourceGroup {

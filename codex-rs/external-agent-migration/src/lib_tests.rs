@@ -809,12 +809,19 @@ fn codex_source_dispatch_returns_noop_for_claude_specific_capabilities() {
     assert!(!source.supports_memory());
     assert!(!source.supports_plugin_migration(None));
     assert_eq!(
-        source.recent_sessions(Path::new("/home"), Path::new("/home/.dopax"), Default::default())
+        source
+            .recent_sessions(
+                Path::new("/home"),
+                Path::new("/home/.dopax"),
+                Default::default()
+            )
             .expect("no sessions"),
         Vec::new()
     );
     assert_eq!(
-        source.home_instruction_sources(Path::new("/home")).expect("home sources"),
+        source
+            .home_instruction_sources(Path::new("/home"))
+            .expect("home sources"),
         Vec::<PathBuf>::new()
     );
 }
