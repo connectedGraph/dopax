@@ -118,10 +118,7 @@ def lint_utf8_ascii(filename: Path, fix: bool) -> bool:
             codepoint = ord(char)
             if char == "\n":
                 continue
-            if (
-                not (0x20 <= codepoint <= 0x7E)
-                and not is_allowed(codepoint)
-            ):
+            if not (0x20 <= codepoint <= 0x7E) and not is_allowed(codepoint):
                 errors.append((lineno, colno, char, codepoint))
 
     if errors:
