@@ -1,2 +1,7 @@
 codex-rs/app-server-protocol/schema/** linguist-generated
 codex-rs/hooks/schema/generated/** linguist-generated
+
+# Bilingual README contains CJK text and block-element ASCII art; keep LF on
+# every platform so the asciicheck CI guard sees the same bytes locally.
+README.md text eol=lf
+README.zh-CN.md text eol=lf

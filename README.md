@@ -32,28 +32,28 @@
 
 General coding assistants assume a neurotypical operating mode: clean context, steady momentum, easy task initiation. Dopax assumes the opposite as a **silent, non-pathologizing default** — mild executive dysfunction, high startup friction, time blindness — and quietly builds the scaffolding in:
 
-- **No labels, no check-ins.** It never says "ADHD" back at you or asks how your mood is. Care shows up as *structure*: smaller first steps, clearer options, lower activation energy.
+- **No labels, no check-ins.** It never says "ADHD" back at you or asks how your mood is. Care shows up as _structure_: smaller first steps, clearer options, lower activation energy.
 - **Micro-chunking on demand.** When a task feels heavy, it gets shredded into two-line wins instead of delivered as one intimidating block.
 - **5-minute rule baked in.** Proposing "just do the smallest slice for 5 minutes, permission to stop after" is a default move, not an intervention.
 - **Time blindness compensation.** Artificial mini-deadlines, short focus sprints, and visible timelines instead of vague "later".
 - **Stable, non-judging presence.** It doesn't get frustrated at abandoned threads or restarts. Come back, pick up, continue.
 
-It's still a full coding agent underneath — the point is that the *relational layer* and the *tooling layer* both bend toward lower friction.
+It's still a full coding agent underneath — the point is that the _relational layer_ and the _tooling layer_ both bend toward lower friction.
 
 ## ✨ What's different from upstream
 
 Dopax tracks `openai/codex` closely (currently **0.151.0**) and layers a small, surgical delta on top:
 
-| Area | Change |
-|---|---|
-| **System prompt** | A full ADHD-informed relational layer: invisible supportive default, task shredding, 5-minute rule, temptation bundling, time-blindness strategies. Ships in base / Claude / Codex prompt variants (`codex-rs/dopax_system_prompt*.md`). |
-| **Experience manager** | New `dopax_experience_manager` tool: tracks ongoing projects, milestones, and personal-growth events with date ranges. Auto-injects `<current_time>` and `<active_experiences>` into context; expired/completed experiences purge on startup. (`core/src/experiences.rs`) |
-| **Multi-select questions** | New `request_user_multi_select` tool so the agent can ask one structured question with several pickable answers instead of free-form back-and-forth. |
-| **Own home directory** | `DOPAX_HOME` env var (falls back to `CODEX_HOME`), defaulting to `~/.dopax` — Dopax and upstream Codex can coexist on one machine. |
-| **Custom providers** | `dopax login --api-key` offers an interactive choice: official OpenAI or any OpenAI-compatible Responses endpoint (relay/proxy/local), written to `config.toml` as the `dopax-custom` provider. |
-| **Tolerant model listing** | `/models` parsing accepts the strict Codex backend shape, loose relay shapes, and the standard OpenAI `{"object":"list","data":[...]}` shape — so third-party relays drive the model picker too. |
-| **Codex import** | One-click migration from an existing `~/.codex` install (settings, history, sessions, memories) into Dopax. *(Port to the new source-adapter architecture in progress.)* |
-| **Branding** | TUI session header, `/app`, `/skills`, import flows — all Dopax. |
+| Area                       | Change                                                                                                                                                                                                                                                                    |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **System prompt**          | A full ADHD-informed relational layer: invisible supportive default, task shredding, 5-minute rule, temptation bundling, time-blindness strategies. Ships in base / Claude / Codex prompt variants (`codex-rs/dopax_system_prompt*.md`).                                  |
+| **Experience manager**     | New `dopax_experience_manager` tool: tracks ongoing projects, milestones, and personal-growth events with date ranges. Auto-injects `<current_time>` and `<active_experiences>` into context; expired/completed experiences purge on startup. (`core/src/experiences.rs`) |
+| **Multi-select questions** | New `request_user_multi_select` tool so the agent can ask one structured question with several pickable answers instead of free-form back-and-forth.                                                                                                                      |
+| **Own home directory**     | `DOPAX_HOME` env var (falls back to `CODEX_HOME`), defaulting to `~/.dopax` — Dopax and upstream Codex can coexist on one machine.                                                                                                                                        |
+| **Custom providers**       | `dopax login --api-key` offers an interactive choice: official OpenAI or any OpenAI-compatible Responses endpoint (relay/proxy/local), written to `config.toml` as the `dopax-custom` provider.                                                                           |
+| **Tolerant model listing** | `/models` parsing accepts the strict Codex backend shape, loose relay shapes, and the standard OpenAI `{"object":"list","data":[...]}` shape — so third-party relays drive the model picker too.                                                                          |
+| **Codex import**           | One-click migration from an existing `~/.codex` install (settings, history, sessions, memories) into Dopax. _(Port to the new source-adapter architecture in progress.)_                                                                                                  |
+| **Branding**               | TUI session header, `/app`, `/skills`, import flows — all Dopax.                                                                                                                                                                                                          |
 
 Everything else is upstream: sandboxing, MCP, plugins, hooks, agents dashboard, plan mode, memory.
 

@@ -6,7 +6,7 @@
 ░▀▀░░▀▀▀░▀░░░▀░▀░▀░▀
 ```
 
-```
+````
 
 </h1>
 
@@ -67,7 +67,7 @@ Dopax 紧跟 `openai/codex`（当前基线 **0.151.0**），只在其上叠加�
 git clone https://github.com/connectedGraph/dopax.git
 cd dopax/codex-rs
 cargo build --release -p codex-cli
-```
+````
 
 产物为 `target/release/dopax`（由上游 `codex` CLI 入口改名而来——命令与参数完全一致）。
 

@@ -45,6 +45,32 @@ allowed_unicode_codepoints = {
     0x2728,  # sparkles
 }
 
+"""
+Unicode ranges that are allowed in addition to ASCII and
+`allowed_unicode_codepoints`. Used for files that intentionally carry
+non-ASCII content (e.g. the bilingual README): CJK text, block-element
+ASCII-art logos, fullwidth punctuation, and emoji. These characters do not
+contain the invisible whitespace (NBSP, narrow NBSP) that the script exists
+to catch, so allowing them does not weaken the anchor-safety guarantee.
+"""
+allowed_unicode_ranges = {
+    (0x00B7, 0x00B7),  # middle dot
+    (0x2000, 0x206F),  # general punctuation (en/em dash, etc.)
+    (0x2580, 0x259F),  # block elements (ASCII-art logos)
+    (0x2600, 0x27BF),  # misc symbols + dingbats (emoji-adjacent)
+    (0x3000, 0x303F),  # CJK punctuation
+    (0x4E00, 0x9FFF),  # CJK unified ideographs
+    (0xFE00, 0xFE0F),  # variation selectors (emoji presentation)
+    (0xFF00, 0xFFEF),  # fullwidth forms
+    (0x1F000, 0x1FAFF),  # emoji blocks
+}
+
+
+def is_allowed(codepoint: int) -> bool:
+    if codepoint in allowed_unicode_codepoints:
+        return True
+    return any(lo <= codepoint <= hi for lo, hi in allowed_unicode_ranges)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -94,7 +120,7 @@ def lint_utf8_ascii(filename: Path, fix: bool) -> bool:
                 continue
             if (
                 not (0x20 <= codepoint <= 0x7E)
-                and codepoint not in allowed_unicode_codepoints
+                and not is_allowed(codepoint)
             ):
                 errors.append((lineno, colno, char, codepoint))
 
