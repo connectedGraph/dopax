@@ -1,81 +1,123 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
+<h1 align="center">
+
+```
+______ ___________  ___  __   __
+|  _  \  _  | ___ \/ _ \ \ \ / /
+| | | | | | | |_/ / /_\ \ \ V /
+| | | | | | |  __/|  _  | /   \
+| |/ /\ \_/ / |   | | | |/ /^\ \
+|___/  \___/\_|   \_| |_/\/   \/
+
+```
+
+</h1>
+
 <p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
+  <strong>A terminal agent tuned for how ADHD brains actually work.</strong><br>
+  A fork of <a href="https://github.com/openai/codex">openai/codex</a> — rebranded, re-prompted, and re-wired so starting, continuing, and finishing work takes less friction.
 </p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+
+<p align="center">
+  <a href="#-why-dopax">Why</a> ·
+  <a href="#-whats-different">What's different</a> ·
+  <a href="#-install--build">Install</a> ·
+  <a href="#-configuration">Config</a> ·
+  <a href="#-upstream-sync">Upstream sync</a> ·
+  <a href="#-license">License</a>
+</p>
 
 ---
 
-## Quickstart
+## 🧠 Why Dopax
 
-### Installing and running Codex CLI
+General coding assistants assume a neurotypical operating mode: clean context, steady momentum, easy task initiation. Dopax assumes the opposite as a **silent, non-pathologizing default** — mild executive dysfunction, high startup friction, time blindness — and quietly builds the scaffolding in:
 
-Run the following on Mac or Linux to install Codex CLI:
+- **No labels, no check-ins.** It never says "ADHD" back at you or asks how your mood is. Care shows up as *structure*: smaller first steps, clearer options, lower activation energy.
+- **Micro-chunking on demand.** When a task feels heavy, it gets shredded into two-line wins instead of delivered as one intimidating block.
+- **5-minute rule baked in.** Proposing "just do the smallest slice for 5 minutes, permission to stop after" is a default move, not an intervention.
+- **Time blindness compensation.** Artificial mini-deadlines, short focus sprints, and visible timelines instead of vague "later".
+- **Stable, non-judging presence.** It doesn't get frustrated at abandoned threads or restarts. Come back, pick up, continue.
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+It's still a full coding agent underneath — the point is that the *relational layer* and the *tooling layer* both bend toward lower friction.
+
+## ✨ What's different from upstream
+
+Dopax tracks `openai/codex` closely (currently **0.151.0**) and layers a small, surgical delta on top:
+
+| Area | Change |
+|---|---|
+| **System prompt** | A full ADHD-informed relational layer: invisible supportive default, task shredding, 5-minute rule, temptation bundling, time-blindness strategies. Ships in base / Claude / Codex prompt variants (`codex-rs/dopax_system_prompt*.md`). |
+| **Experience manager** | New `dopax_experience_manager` tool: tracks ongoing projects, milestones, and personal-growth events with date ranges. Auto-injects `<current_time>` and `<active_experiences>` into context; expired/completed experiences purge on startup. (`core/src/experiences.rs`) |
+| **Multi-select questions** | New `request_user_multi_select` tool so the agent can ask one structured question with several pickable answers instead of free-form back-and-forth. |
+| **Own home directory** | `DOPAX_HOME` env var (falls back to `CODEX_HOME`), defaulting to `~/.dopax` — Dopax and upstream Codex can coexist on one machine. |
+| **Custom providers** | `dopax login --api-key` offers an interactive choice: official OpenAI or any OpenAI-compatible Responses endpoint (relay/proxy/local), written to `config.toml` as the `dopax-custom` provider. |
+| **Tolerant model listing** | `/models` parsing accepts the strict Codex backend shape, loose relay shapes, and the standard OpenAI `{"object":"list","data":[...]}` shape — so third-party relays drive the model picker too. |
+| **Codex import** | One-click migration from an existing `~/.codex` install (settings, history, sessions, memories) into Dopax. *(Port to the new source-adapter architecture in progress.)* |
+| **Branding** | TUI session header, `/app`, `/skills`, import flows — all Dopax. |
+
+Everything else is upstream: sandboxing, MCP, plugins, hooks, agents dashboard, plan mode, memory.
+
+## 📦 Install / Build
+
+Prerequisites: Rust (stable, recent), Node not required.
+
+```bash
+git clone https://github.com/connectedGraph/dopax.git
+cd dopax/codex-rs
+cargo build --release -p codex-cli
 ```
 
-Run the following on Windows to install Codex CLI:
+The binary is `target/release/dopax` (aliased from the upstream `codex` CLI entrypoint — same commands, same flags).
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+```bash
+# first run
+dopax            # interactive TUI
+dopax login      # ChatGPT, or `dopax login --api-key` for custom providers
 ```
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+> **Windows note:** build and tests are verified on Windows 11. For the test suite use `RUST_MIN_STACK=16777216 cargo test -p codex-tui --lib` — the default 1 MB test stack overflows on Windows (see upstream #… for the same behavior on vanilla codex).
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
+## ⚙️ Configuration
+
+Dopax reads `~/.dopax/config.toml` (same format as upstream Codex). Highlights:
+
+```toml
+# Point at any OpenAI-compatible endpoint
+[model_providers.dopax-custom]
+name = "My relay"
+base_url = "https://my-relay.example.com/v1"
+wire_api = "responses"
+
+model_provider = "dopax-custom"
 ```
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
+- `DOPAX_HOME` overrides the home directory; `CODEX_HOME` still works as a fallback.
+- Existing Codex users: run `/import` inside the TUI to pull over settings, history, and sessions.
+- The experience manager stores its data under `~/.dopax/experiences.json` and is gated by the `current_time_reminder` feature flag.
 
-Codex CLI can also be installed via the following package managers:
+## 🔄 Upstream sync
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
+Dopax is a **thin fork**: the entire product delta is a handful of files, so upstream releases are merged wholesale rather than cherry-picked.
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+- Current base: `openai/codex` **rust-v0.151.0** (2026-08-29)
+- Sync cadence: every 1–2 upstream stable releases
+- Merge history lives on the `dopax/merge-*` branches and in commit messages
 
-Then simply run `codex` to get started.
+## 🗺️ Roadmap
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+- [ ] Port the "import from Codex" migration to the new `external-agent-migration` source-adapter architecture
+- [ ] Experience timeline visualization in the TUI
+- [ ] Configurable prompt profile picker (supportive / neutral / focused)
+- [ ] Publish signed release binaries
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+## 📄 License
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+Same as upstream: [Apache-2.0](LICENSE).
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+---
 
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+<p align="center">
+<sub>
+<code>dopax</code> — because the hardest commit is the first one.
+</sub>
+</p>
