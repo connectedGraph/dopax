@@ -786,3 +786,46 @@ fn hook_migration_drops_negative_timeouts() {
         .expect("object")
     );
 }
+
+#[test]
+fn from_migration_source_maps_codex() {
+    use crate::migration_source::ExternalAgentSource;
+    assert_eq!(
+        ExternalAgentSource::from_migration_source(Some("codex")),
+        ExternalAgentSource::Codex
+    );
+    assert_eq!(
+        ExternalAgentSource::from_migration_source(Some("CODEX")),
+        ExternalAgentSource::Codex
+    );
+}
+
+#[test]
+fn codex_source_dispatch_returns_noop_for_claude_specific_capabilities() {
+    use crate::migration_source::ExternalAgentSource;
+    let source = ExternalAgentSource::Codex;
+    assert!(source.is_codex());
+    assert_eq!(source.config_dir(), ".codex");
+    assert!(!source.supports_memory());
+    assert!(!source.supports_plugin_migration(None));
+    assert_eq!(
+        source.recent_sessions(Path::new("/home"), Path::new("/home/.dopax"), Default::default())
+            .expect("no sessions"),
+        Vec::new()
+    );
+    assert_eq!(
+        source.home_instruction_sources(Path::new("/home")).expect("home sources"),
+        Vec::<PathBuf>::new()
+    );
+}
+
+#[test]
+fn codex_scope_home_settings_file_is_config_toml() {
+    use crate::migration_source::ExternalAgentSource;
+    use crate::scope::MigrationScope;
+    let source = ExternalAgentSource::Codex;
+    assert_eq!(
+        source.settings_file_name(&MigrationScope::home()),
+        "config.toml"
+    );
+}

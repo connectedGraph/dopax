@@ -30,6 +30,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use toml::Value as TomlValue;
 
@@ -85,7 +87,9 @@ impl ExternalAgentConfigService {
             || self.codex_home.join("config.toml"),
             |repo_root| repo_root.join(".codex").join("config.toml"),
         );
-        if let Some(settings) = settings.as_ref() {
+        if self.source.is_codex() {
+            self.detect_codex_config(&source_settings, &target_config, cwd.clone(), items)?;
+        } else if let Some(settings) = settings.as_ref() {
             let migrated = self.source.build_config(settings)?;
             if !is_empty_toml_table(&migrated) {
                 let mut should_include = true;
@@ -416,6 +420,66 @@ impl ExternalAgentConfigService {
                     /*skills_count*/ None,
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// Codex config is already TOML (homogeneous with the target), so it is
+    /// detected by parsing the source `config.toml` directly instead of the
+    /// JSON settings pipeline used for Claude/Cursor.
+    fn detect_codex_config(
+        &self,
+        source_settings: &Path,
+        target_config: &Path,
+        cwd: Option<PathBuf>,
+        items: &mut Vec<ExternalAgentConfigMigrationItem>,
+    ) -> io::Result<()> {
+        if !source_settings.is_file() {
+            return Ok(());
+        }
+        let source_raw = fs::read_to_string(source_settings)?;
+        let migrated = match toml::from_str::<TomlValue>(&source_raw) {
+            Ok(migrated) => migrated,
+            Err(err) => {
+                return Err(invalid_data_error(format!(
+                    "invalid source config.toml: {err}"
+                )))
+            }
+        };
+        if is_empty_toml_table(&migrated) {
+            return Ok(());
+        }
+
+        let mut should_include = true;
+        if target_config.exists() {
+            let existing_raw = fs::read_to_string(target_config)?;
+            let mut existing = if existing_raw.trim().is_empty() {
+                TomlValue::Table(Default::default())
+            } else {
+                toml::from_str::<TomlValue>(&existing_raw).map_err(|err| {
+                    invalid_data_error(format!("invalid existing config.toml: {err}"))
+                })?
+            };
+            should_include = merge_missing_toml_values(&mut existing, &migrated)?;
+        }
+
+        if should_include {
+            items.push(ExternalAgentConfigMigrationItem {
+                item_type: ExternalAgentConfigMigrationItemType::Config,
+                description: format!(
+                    "Migrate {} into {}",
+                    source_settings.display(),
+                    target_config.display()
+                ),
+                cwd,
+                details: None,
+            });
+            emit_migration_metric(
+                EXTERNAL_AGENT_CONFIG_DETECT_METRIC,
+                ExternalAgentConfigMigrationItemType::Config,
+                /*skills_count*/ None,
+            );
         }
 
         Ok(())

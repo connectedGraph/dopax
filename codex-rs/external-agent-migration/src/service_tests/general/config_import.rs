@@ -520,3 +520,131 @@ async fn detect_home_skips_skills_when_all_skill_directories_exist() {
 
     assert_eq!(items, Vec::<ExternalAgentConfigMigrationItem>::new());
 }
+
+#[tokio::test]
+async fn codex_home_detect_lists_config_when_target_missing() {
+    let (_root, external_agent_home, codex_home) = fixture_paths();
+    fs::create_dir_all(&external_agent_home).expect("create external agent home");
+    fs::write(
+        external_agent_home.join("config.toml"),
+        r#"
+model = "gpt-5"
+[model_providers.dopax-custom]
+name = "relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+
+[mcp_servers.weather]
+command = "python"
+args = ["weather.py"]
+"#,
+    )
+    .expect("write codex config.toml");
+
+    let mut service = service_for_paths(external_agent_home.clone(), codex_home.clone());
+    service.source = crate::migration_source::ExternalAgentSource::Codex;
+
+    let items = service
+        .detect(ExternalAgentConfigDetectOptions {
+            include_home: true,
+            include_memory: false,
+            cwds: None,
+        })
+        .await
+        .expect("detect");
+
+    let config_items = items
+        .iter()
+        .filter(|item| item.item_type == ExternalAgentConfigMigrationItemType::Config)
+        .count();
+    assert_eq!(config_items, 1, "expected one config item: {items:?}");
+}
+
+#[tokio::test]
+async fn codex_home_import_merges_toml_config_including_mcp_servers() {
+    let (_root, external_agent_home, codex_home) = fixture_paths();
+    fs::create_dir_all(&external_agent_home).expect("create external agent home");
+    fs::write(
+        external_agent_home.join("config.toml"),
+        r#"
+model = "gpt-5"
+
+[model_providers.dopax-custom]
+name = "relay"
+base_url = "https://relay.example.com/v1"
+wire_api = "responses"
+
+[mcp_servers.weather]
+command = "python"
+args = ["weather.py"]
+"#,
+    )
+    .expect("write codex config.toml");
+
+    let mut service = service_for_paths(external_agent_home.clone(), codex_home.clone());
+    service.source = crate::migration_source::ExternalAgentSource::Codex;
+
+    let items = service
+        .detect(ExternalAgentConfigDetectOptions {
+            include_home: true,
+            include_memory: false,
+            cwds: None,
+        })
+        .await
+        .expect("detect");
+    let config_items: Vec<_> = items
+        .into_iter()
+        .filter(|item| item.item_type == ExternalAgentConfigMigrationItemType::Config)
+        .collect();
+    assert_eq!(config_items.len(), 1);
+
+    let outcome = service.import(config_items).await;
+    assert_eq!(outcome.item_results.len(), 1);
+    assert_eq!(outcome.item_results[0].error_count, 0);
+
+    let written = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+    let config: TomlValue = toml::from_str(&written).expect("parse config");
+    let mcp_servers = config
+        .get("mcp_servers")
+        .and_then(|value| value.as_table())
+        .expect("mcp_servers table");
+    assert!(mcp_servers.contains_key("weather"));
+    assert_eq!(
+        config.get("model").and_then(|value| value.as_str()),
+        Some("gpt-5")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a real ~/.codex home on the machine"]
+async fn codex_real_home_detect_finds_config_and_skills() {
+    let codex_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .expect("home dir")
+        .join(".codex");
+    if !codex_home.join("config.toml").is_file() {
+        return;
+    }
+    let temp = TempDir::new().expect("tempdir");
+    let mut service = service_for_paths(codex_home.clone(), temp.path().to_path_buf());
+    service.source = crate::migration_source::ExternalAgentSource::Codex;
+
+    let items = service
+        .detect(ExternalAgentConfigDetectOptions {
+            include_home: true,
+            include_memory: false,
+            cwds: None,
+        })
+        .await
+        .expect("detect");
+    let types: Vec<_> = items
+        .iter()
+        .map(|item| item.item_type)
+        .collect();
+    println!("detected items: {types:?}");
+    assert!(
+        types.contains(&ExternalAgentConfigMigrationItemType::Config),
+        "expected a Config item from the real codex home: {types:?}"
+    );
+}

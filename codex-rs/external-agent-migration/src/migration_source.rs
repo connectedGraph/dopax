@@ -1,4 +1,5 @@
 use crate::ClaSource;
+use crate::CodexSource;
 use crate::CurSource;
 use crate::RewriteProfile;
 use crate::detect::plugins;
@@ -53,6 +54,7 @@ pub(super) enum ExternalAgentSource {
     #[default]
     Cla,
     Cur,
+    Codex,
 }
 
 impl ExternalAgentSource {
@@ -61,15 +63,24 @@ impl ExternalAgentSource {
             .is_some_and(|source| source.eq_ignore_ascii_case(CurSource::MIGRATION_SOURCE))
         {
             Self::Cur
+        } else if migration_source
+            .is_some_and(|source| source.eq_ignore_ascii_case(CodexSource::MIGRATION_SOURCE))
+        {
+            Self::Codex
         } else {
             Self::Cla
         }
+    }
+
+    pub(super) fn is_codex(self) -> bool {
+        matches!(self, Self::Codex)
     }
 
     pub(super) fn config_dir(self) -> &'static str {
         match self {
             Self::Cla => ClaSource::CONFIG_DIR,
             Self::Cur => CurSource::CONFIG_DIR,
+            Self::Codex => CodexSource::CONFIG_DIR,
         }
     }
 
@@ -85,6 +96,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => true,
             Self::Cur => false,
+            Self::Codex => false,
         }
     }
 
@@ -93,6 +105,7 @@ impl ExternalAgentSource {
             (Self::Cla, _) => ClaSource::SETTINGS_FILE,
             (Self::Cur, MigrationScope::Home) => CurSource::HOME_CONFIG_FILE,
             (Self::Cur, MigrationScope::Repository { .. }) => CurSource::PROJECT_CONFIG_FILE,
+            (Self::Codex, _) => CodexSource::SETTINGS_FILE,
         }
     }
 
@@ -103,6 +116,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::effective_settings(source_settings),
             Self::Cur => CurSource::effective_settings(source_settings),
+            Self::Codex => Ok(None),
         }
     }
 
@@ -110,6 +124,9 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::build_config(settings),
             Self::Cur => CurSource::build_config(settings),
+            Self::Codex => Err(crate::utils::invalid_data_error(
+                "codex config is TOML, not JSON settings; use the homogeneous TOML path",
+            )),
         }
     }
 
@@ -121,6 +138,7 @@ impl ExternalAgentSource {
             Self::Cla => Ok(plugins::detect_cla_plugins(&context)),
             Self::Cur if context.repo_root.is_none() => plugins::detect_cur_plugins(&context),
             Self::Cur => Ok(None),
+            Self::Codex => Ok(None),
         }
     }
 
@@ -128,6 +146,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => plugins::can_detect_cla_plugins(settings),
             Self::Cur => true,
+            Self::Codex => false,
         }
     }
 
@@ -144,6 +163,7 @@ impl ExternalAgentSource {
             Self::Cur => {
                 detect_recent_cur_sessions_with_limits(external_agent_home, codex_home, limits)
             }
+            Self::Codex => Ok(Vec::new()),
         }
     }
 
@@ -151,6 +171,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => SessionMetadataMode::Embedded,
             Self::Cur => SessionMetadataMode::MigrationFallback,
+            Self::Codex => SessionMetadataMode::MigrationFallback,
         }
     }
 
@@ -158,6 +179,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::connector_metadata_roots(external_agent_home),
             Self::Cur => Vec::new(),
+            Self::Codex => Vec::new(),
         }
     }
 
@@ -170,6 +192,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => detect_cla_session_connectors(sessions, connector_metadata_roots),
             Self::Cur => detect_cur_session_connectors(sessions, external_agent_home),
+            Self::Codex => Vec::new(),
         }
     }
 
@@ -186,6 +209,7 @@ impl ExternalAgentSource {
             Self::Cur => {
                 detect_cur_session_connectors_by_source_path(sessions, external_agent_home)
             }
+            Self::Codex => BTreeMap::new(),
         }
     }
 
@@ -207,6 +231,7 @@ impl ExternalAgentSource {
                 })
                 .unwrap_or_default()),
             Self::Cur => source_cur::marketplace_import_sources(external_agent_home),
+            Self::Codex => Ok(BTreeMap::new()),
         }
     }
 
@@ -220,6 +245,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::build_mcp_config(source_root, external_agent_home, settings),
             Self::Cur => CurSource::build_mcp_config(source_config_dir),
+            Self::Codex => Ok(TomlValue::Table(Default::default())),
         }
     }
 
@@ -231,6 +257,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => source_root,
             Self::Cur => source_config_dir.join("mcp.json"),
+            Self::Codex => source_config_dir.join(CodexSource::SETTINGS_FILE),
         }
     }
 
@@ -241,6 +268,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::repo_instruction_source_groups(repo_root),
             Self::Cur => CurSource::repo_instruction_source_groups(repo_root),
+            Self::Codex => CodexSource::repo_instruction_source_groups(repo_root),
         }
     }
 
@@ -251,6 +279,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::home_instruction_sources(external_agent_home),
             Self::Cur => Ok(Vec::new()),
+            Self::Codex => CodexSource::home_instruction_sources(external_agent_home),
         }
     }
 
@@ -258,6 +287,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::read_instruction_source(path),
             Self::Cur => CurSource::read_instruction_source(path),
+            Self::Codex => CodexSource::read_instruction_source(path),
         }
     }
 
@@ -269,6 +299,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => source_cla::import_source_commands(source_commands, target_skills),
             Self::Cur => source_cur::import_source_commands(source_commands, target_skills),
+            Self::Codex => Ok(Vec::new()),
         }
     }
 
@@ -280,6 +311,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => source_cla::count_missing_source_commands(source_commands, target_skills),
             Self::Cur => source_cur::count_missing_source_commands(source_commands, target_skills),
+            Self::Codex => Ok(0),
         }
     }
 
@@ -291,6 +323,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => source_cla::missing_source_command_names(source_commands, target_skills),
             Self::Cur => source_cur::missing_source_command_names(source_commands, target_skills),
+            Self::Codex => Ok(Vec::new()),
         }
     }
 
@@ -302,6 +335,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::import_subagents(source_agents, target_agents),
             Self::Cur => CurSource::import_subagents(source_agents, target_agents),
+            Self::Codex => Ok(Vec::new()),
         }
     }
 
@@ -313,6 +347,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::hook_event_names(source_dir, target_hooks),
             Self::Cur => CurSource::hook_event_names(source_dir, target_hooks),
+            Self::Codex => Ok(Vec::new()),
         }
     }
 
@@ -320,6 +355,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => ClaSource::import_hooks(source_dir, target_hooks),
             Self::Cur => CurSource::import_hooks(source_dir, target_hooks),
+            Self::Codex => Ok(false),
         }
     }
 
@@ -327,6 +363,7 @@ impl ExternalAgentSource {
         match self {
             Self::Cla => source_cla::REWRITE_PROFILE,
             Self::Cur => source_cur::REWRITE_PROFILE,
+            Self::Codex => CodexSource::REWRITE_PROFILE,
         }
     }
 }

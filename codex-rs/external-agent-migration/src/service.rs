@@ -559,6 +559,9 @@ impl ExternalAgentConfigService {
             MigrationScope::Home => self.codex_home.join("config.toml"),
             MigrationScope::Repository { root } => root.join(".codex").join("config.toml"),
         };
+        if self.source.is_codex() {
+            return self.import_config_toml(&source_settings, &target_config);
+        }
         let Some(settings) = self.effective_source_settings(&scope)? else {
             return Ok(None);
         };
@@ -567,19 +570,53 @@ impl ExternalAgentConfigService {
             return Ok(None);
         }
 
+        self.write_config_toml(&source_settings, &target_config, &migrated)
+    }
+
+    /// Codex config is already TOML (homogeneous with the target), so it is
+    /// merged directly instead of going through the JSON settings pipeline.
+    fn import_config_toml(
+        &self,
+        source_settings: &Path,
+        target_config: &Path,
+    ) -> io::Result<Option<(String, String)>> {
+        if !source_settings.is_file() {
+            return Ok(None);
+        }
+        let source_raw = fs::read_to_string(source_settings)?;
+        let migrated = match toml::from_str::<TomlValue>(&source_raw) {
+            Ok(migrated) => migrated,
+            Err(err) => {
+                return Err(invalid_data_error(format!(
+                    "invalid source config.toml: {err}"
+                )))
+            }
+        };
+        if is_empty_toml_table(&migrated) {
+            return Ok(None);
+        }
+        self.write_config_toml(source_settings, target_config, &migrated)
+    }
+
+    fn write_config_toml(
+        &self,
+        source_settings: &Path,
+        target_config: &Path,
+        migrated: &TomlValue,
+    ) -> io::Result<Option<(String, String)>> {
         let Some(target_parent) = target_config.parent() else {
             return Err(invalid_data_error("config target path has no parent"));
         };
         fs::create_dir_all(target_parent)?;
         if !target_config.exists() {
-            write_toml_file(&target_config, &migrated)?;
+            write_toml_file(target_config, migrated)?;
             return Ok(Some((
                 source_settings.display().to_string(),
                 target_config.display().to_string(),
             )));
         }
 
-        let existing_raw = fs::read_to_string(&target_config)?;
+        let existing_raw = fs::read_to_string(target_config)?;
         let mut existing = if existing_raw.trim().is_empty() {
             TomlValue::Table(Default::default())
         } else {
@@ -587,12 +624,12 @@ impl ExternalAgentConfigService {
                 .map_err(|err| invalid_data_error(format!("invalid existing config.toml: {err}")))?
         };
 
-        let changed = merge_missing_toml_values(&mut existing, &migrated)?;
+        let changed = merge_missing_toml_values(&mut existing, migrated)?;
         if !changed {
             return Ok(None);
         }
 
-        write_toml_file(&target_config, &existing)?;
+        write_toml_file(target_config, &existing)?;
         Ok(Some((
             source_settings.display().to_string(),
             target_config.display().to_string(),

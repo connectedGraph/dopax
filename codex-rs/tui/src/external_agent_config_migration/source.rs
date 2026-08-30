@@ -24,15 +24,17 @@ use tokio_stream::StreamExt;
 pub(crate) enum ExternalAgentConfigMigrationSource {
     Cla,
     Cur,
+    Codex,
 }
 
 impl ExternalAgentConfigMigrationSource {
-    pub(crate) const ALL: [Self; 2] = [Self::Cla, Self::Cur];
+    pub(crate) const ALL: [Self; 3] = [Self::Cla, Self::Cur, Self::Codex];
 
     pub(crate) fn migration_source(self) -> &'static str {
         match self {
             Self::Cla => "claude-code",
             Self::Cur => "cursor",
+            Self::Codex => "codex",
         }
     }
 
@@ -40,6 +42,7 @@ impl ExternalAgentConfigMigrationSource {
         match self {
             Self::Cla => "Claude Code",
             Self::Cur => "Cursor",
+            Self::Codex => "Codex",
         }
     }
 }

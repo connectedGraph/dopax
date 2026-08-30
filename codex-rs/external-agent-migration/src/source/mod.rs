@@ -1,4 +1,5 @@
 mod cla;
+mod codex;
 mod cur;
 
 use crate::invalid_data_error;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use toml::Value as TomlValue;
 
 pub use cla::ClaSource;
+pub use codex::CodexSource;
 pub use cur::CurSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
