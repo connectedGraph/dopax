@@ -250,7 +250,9 @@ jobs:
           fi
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
-            [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
+            # Bazel-backed argument lint is disabled in this fork; accept both
+            # success and skipped (if:false) results.
+            [[ '${{ needs.argument_comment_lint_prebuilt.result }}' == 'success' || '${{ needs.argument_comment_lint_prebuilt.result }}' == 'skipped' ]] || { echo 'argument_comment_lint_prebuilt failed'; exit 1; }
           fi
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_CODEX}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then

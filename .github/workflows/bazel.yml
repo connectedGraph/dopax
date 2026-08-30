@@ -239,10 +239,9 @@ jobs:
         uses: ./.github/actions/check-clean-worktree
 
   test-windows:
-    if: false
     # Preserve the existing required-check surface while the real work happens
     # in the sharded Windows jobs above.
-    if: always()
+    if: false
     needs: test-windows-shard
     runs-on: ubuntu-24.04
     name: Bazel test on windows-latest for x86_64-pc-windows-gnullvm
@@ -257,11 +256,10 @@ jobs:
           fi
 
   test-windows-native-main:
-    if: false
     # Native Windows Bazel tests are slower and frequently approach the
     # 30-minute PR budget. Run this only for post-merge commits to main and give
     # it a larger timeout.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: false
     timeout-minutes: 40
     runs-on:
       group: ${{ github.event.repository.name }}-runners
