@@ -310,14 +310,16 @@ mod tests {
             etag: None,
         };
 
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.99.0");
         let client = ModelsClient::new(
             transport,
-            provider("https://example.com/api/codex"),
+            provider,
             Arc::new(DummyAuth),
         );
 
         let (models, _) = client
-            .list_models("0.99.0", HeaderMap::new())
+            .list_models(request_url, HeaderMap::new())
             .await
             .expect("request should succeed");
 
