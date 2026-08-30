@@ -26,6 +26,10 @@ ______ ___________  ___  __   __
   <a href="#-license">License</a>
 </p>
 
+<p align="center">
+  <a href="README.zh-CN.md">简体中文</a> | <a href="README.md">English</a>
+</p>
+
 ---
 
 ## 🧠 Why Dopax
@@ -75,7 +79,7 @@ dopax            # interactive TUI
 dopax login      # ChatGPT, or `dopax login --api-key` for custom providers
 ```
 
-> **Windows note:** build and tests are verified on Windows 11. For the test suite use `RUST_MIN_STACK=16777216 cargo test -p codex-tui --lib` — the default 1 MB test stack overflows on Windows (see upstream #… for the same behavior on vanilla codex).
+> **Windows note:** build and tests are verified on Windows 11. For the test suite use `RUST_MIN_STACK=16777216 cargo test -p codex-tui --lib` — the default 1 MB test stack overflows on Windows (upstream codex behaves the same way on vanilla Windows).
 
 ## ⚙️ Configuration
 
